@@ -1,5 +1,7 @@
 /* eslint-env node */
 import mongoose from "mongoose";
+import crypto from "node:crypto";
+import nodemailer from "nodemailer";
 import { Question, User, connectDb } from "./db.js";
 
 const sendJson = (response, statusCode, payload) => {
@@ -35,6 +37,69 @@ const readRequestJson = async (request) =>
 
     request.on("error", reject);
   });
+
+const RESET_OTP_EXPIRY_MS = 10 * 60 * 1000;
+const passwordResetOtps = new Map();
+
+const makeOtp = () => String(Math.floor(100000 + Math.random() * 900000));
+
+const createResetRecord = (email) => {
+  const otp = makeOtp();
+  const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
+
+  passwordResetOtps.set(email, {
+    otpHash,
+    expiresAt: Date.now() + RESET_OTP_EXPIRY_MS,
+  });
+
+  return otp;
+};
+
+const readResetRecord = (email) => {
+  const record = passwordResetOtps.get(email);
+
+  if (!record) {
+    return null;
+  }
+
+  if (Date.now() > record.expiresAt) {
+    passwordResetOtps.delete(email);
+    return null;
+  }
+
+  return record;
+};
+
+const getMailTransport = () => {
+  const host = process.env.SMTP_HOST || "";
+  const port = Number(process.env.SMTP_PORT || "587");
+  const user = process.env.SMTP_USER || "";
+  const pass = process.env.SMTP_PASS || "";
+
+  if (!host || !user || !pass) {
+    throw new Error("SMTP credentials are missing. Add SMTP_HOST, SMTP_PORT, SMTP_USER and SMTP_PASS in backend/.env.");
+  }
+
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    auth: { user, pass },
+  });
+};
+
+const sendResetOtpEmail = async (email, otp) => {
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const transporter = getMailTransport();
+
+  await transporter.sendMail({
+    from,
+    to: email,
+    subject: "Online Quiz password reset OTP",
+    text: `Your OTP is ${otp}. It is valid for 10 minutes.`,
+    html: `<p>Your OTP is <strong>${otp}</strong>.</p><p>It is valid for 10 minutes.</p>`,
+  });
+};
 
 const normalizeUser = (doc) => ({
   id: doc._id.toString(),
@@ -192,6 +257,75 @@ const handleAuth = async (request, response, pathname) => {
     }
 
     sendJson(response, 200, { message: "Login successful.", user: normalizeUser(user) });
+    return true;
+  }
+
+  if (
+    request.method === "POST" &&
+    (pathname === "/api/auth/request-password-reset" || pathname === "/api/auth/send-otp")
+  ) {
+    const body = await readRequestJson(request);
+    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+
+    if (!email) {
+      sendJson(response, 400, { message: "Email is required." });
+      return true;
+    }
+
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      sendJson(response, 404, { message: "No account found with this email." });
+      return true;
+    }
+
+    const otp = createResetRecord(email);
+    await sendResetOtpEmail(email, otp);
+
+    sendJson(response, 200, { message: "OTP sent to your email." });
+    return true;
+  }
+
+  if (
+    request.method === "POST" &&
+    (pathname === "/api/auth/reset-password" || pathname === "/api/auth/verify-otp-reset")
+  ) {
+    const body = await readRequestJson(request);
+    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+    const otp = typeof body.otp === "string" ? body.otp.trim() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+
+    if (!email || !otp || !password) {
+      sendJson(response, 400, { message: "Email, OTP and new password are required." });
+      return true;
+    }
+
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      sendJson(response, 404, { message: "No account found with this email." });
+      return true;
+    }
+
+    const record = readResetRecord(email);
+
+    if (!record) {
+      sendJson(response, 400, { message: "OTP expired or not requested. Please request a new OTP." });
+      return true;
+    }
+
+    const providedOtpHash = crypto.createHash("sha256").update(otp).digest("hex");
+
+    if (providedOtpHash !== record.otpHash) {
+      sendJson(response, 401, { message: "OTP is incorrect." });
+      return true;
+    }
+
+    user.password = password;
+    await user.save();
+    passwordResetOtps.delete(email);
+
+    sendJson(response, 200, { message: "Password updated successfully." });
     return true;
   }
 
