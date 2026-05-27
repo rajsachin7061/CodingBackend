@@ -105,6 +105,7 @@ const getMailTransport = () => {
   const port = Number(process.env.SMTP_PORT || "587");
   const user = (process.env.SMTP_USER || "").trim().toLowerCase();
   const rawPass = (process.env.SMTP_PASS || "").trim();
+  const forceIpv4 = (process.env.SMTP_FORCE_IPV4 || "true").trim().toLowerCase() !== "false";
   // Google App Passwords are often copied with spaces ("xxxx xxxx xxxx xxxx").
   const pass = host.includes("gmail.com") ? rawPass.replace(/\s+/g, "") : rawPass;
 
@@ -112,21 +113,22 @@ const getMailTransport = () => {
     throw new Error("SMTP credentials are missing. Add SMTP_HOST, SMTP_PORT, SMTP_USER and SMTP_PASS in backend/.env.");
   }
 
-  if (host.includes("gmail.com")) {
-    return nodemailer.createTransport({
-      host: "smtp.gmail.com",
-      port: 587,
-      secure: false,
-      auth: { user, pass },
-    });
+  const transportConfig = {
+    host: host.includes("gmail.com") ? "smtp.gmail.com" : host,
+    port: host.includes("gmail.com") ? 587 : port,
+    secure: host.includes("gmail.com") ? false : port === 465,
+    requireTLS: true,
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000,
+    auth: { user, pass },
+  };
+
+  if (forceIpv4) {
+    transportConfig.family = 4;
   }
 
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    auth: { user, pass },
-  });
+  return nodemailer.createTransport(transportConfig);
 };
 
 export const verifySmtpConnection = async () => {
