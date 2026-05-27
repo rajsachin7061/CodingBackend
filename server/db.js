@@ -43,6 +43,8 @@ export const connectDb = async () => {
       .connect(mongoUri, {
         dbName,
         serverSelectionTimeoutMS: 10000,
+        connectTimeoutMS: 10000,
+        socketTimeoutMS: 15000,
       })
       .then(async () => {
         // Ensure both MongoDB collections exist before first user/admin actions.

@@ -40,6 +40,9 @@ const readRequestJson = async (request) =>
 
 const RESET_OTP_EXPIRY_MS = 10 * 60 * 1000;
 const passwordResetOtps = new Map();
+const registerOtps = new Map();
+let smtpReady = false;
+let smtpLastError = "";
 
 const makeOtp = () => String(Math.floor(100000 + Math.random() * 900000));
 
@@ -70,14 +73,50 @@ const readResetRecord = (email) => {
   return record;
 };
 
+const createRegisterRecord = (email) => {
+  const otp = makeOtp();
+  const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
+
+  registerOtps.set(email, {
+    otpHash,
+    expiresAt: Date.now() + RESET_OTP_EXPIRY_MS,
+  });
+
+  return otp;
+};
+
+const readRegisterRecord = (email) => {
+  const record = registerOtps.get(email);
+
+  if (!record) {
+    return null;
+  }
+
+  if (Date.now() > record.expiresAt) {
+    registerOtps.delete(email);
+    return null;
+  }
+
+  return record;
+};
+
 const getMailTransport = () => {
-  const host = process.env.SMTP_HOST || "";
+  const host = (process.env.SMTP_HOST || "").trim();
   const port = Number(process.env.SMTP_PORT || "587");
-  const user = process.env.SMTP_USER || "";
-  const pass = process.env.SMTP_PASS || "";
+  const user = (process.env.SMTP_USER || "").trim().toLowerCase();
+  const rawPass = (process.env.SMTP_PASS || "").trim();
+  // Google App Passwords are often copied with spaces ("xxxx xxxx xxxx xxxx").
+  const pass = host.includes("gmail.com") ? rawPass.replace(/\s+/g, "") : rawPass;
 
   if (!host || !user || !pass) {
     throw new Error("SMTP credentials are missing. Add SMTP_HOST, SMTP_PORT, SMTP_USER and SMTP_PASS in backend/.env.");
+  }
+
+  if (host.includes("gmail.com")) {
+    return nodemailer.createTransport({
+      service: "gmail",
+      auth: { user, pass },
+    });
   }
 
   return nodemailer.createTransport({
@@ -88,18 +127,48 @@ const getMailTransport = () => {
   });
 };
 
-const sendResetOtpEmail = async (email, otp) => {
+export const verifySmtpConnection = async () => {
+  try {
+    const transporter = getMailTransport();
+    await transporter.verify();
+    smtpReady = true;
+    smtpLastError = "";
+    return true;
+  } catch (error) {
+    smtpReady = false;
+    smtpLastError = error?.message || "SMTP verification failed.";
+    throw error;
+  }
+};
+
+const sendOtpEmail = async ({ email, otp, subject, title }) => {
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
   const transporter = getMailTransport();
 
   await transporter.sendMail({
     from,
     to: email,
-    subject: "Online Quiz password reset OTP",
+    subject,
     text: `Your OTP is ${otp}. It is valid for 10 minutes.`,
-    html: `<p>Your OTP is <strong>${otp}</strong>.</p><p>It is valid for 10 minutes.</p>`,
+    html: `<p>${title}</p><p>Your OTP is <strong>${otp}</strong>.</p><p>It is valid for 10 minutes.</p>`,
   });
 };
+
+const sendResetOtpEmail = async (email, otp) =>
+  sendOtpEmail({
+    email,
+    otp,
+    subject: "Online Quiz password reset OTP",
+    title: "Use this OTP to reset your password.",
+  });
+
+const sendRegisterOtpEmail = async (email, otp) =>
+  sendOtpEmail({
+    email,
+    otp,
+    subject: "Online Quiz email verification OTP",
+    title: "Use this OTP to verify your email and complete registration.",
+  });
 
 const normalizeUser = (doc) => ({
   id: doc._id.toString(),
@@ -286,6 +355,79 @@ const handleAuth = async (request, response, pathname) => {
     return true;
   }
 
+  if (request.method === "POST" && pathname === "/api/auth/request-register-otp") {
+    const body = await readRequestJson(request);
+    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+
+    if (!email) {
+      sendJson(response, 400, { message: "Email is required." });
+      return true;
+    }
+
+    const existingUser = await User.findOne({ email });
+
+    if (existingUser) {
+      sendJson(response, 409, { message: "This email is already registered." });
+      return true;
+    }
+
+    const otp = createRegisterRecord(email);
+    await sendRegisterOtpEmail(email, otp);
+
+    sendJson(response, 200, { message: "Verification OTP sent to your email." });
+    return true;
+  }
+
+  if (request.method === "POST" && pathname === "/api/auth/register-with-otp") {
+    const body = await readRequestJson(request);
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const username = typeof body.username === "string" ? body.username.trim() : "";
+    const otp = typeof body.otp === "string" ? body.otp.trim() : "";
+    const stats = body.stats || {};
+    const resume = body.resume || {};
+
+    if (!name || !email || !password || !otp) {
+      sendJson(response, 400, { message: "Name, email, password and OTP are required." });
+      return true;
+    }
+
+    const existingUser = await User.findOne({ email });
+
+    if (existingUser) {
+      sendJson(response, 409, { message: "This email is already registered." });
+      return true;
+    }
+
+    const record = readRegisterRecord(email);
+
+    if (!record) {
+      sendJson(response, 400, { message: "OTP expired or not requested. Please request a new OTP." });
+      return true;
+    }
+
+    const providedOtpHash = crypto.createHash("sha256").update(otp).digest("hex");
+
+    if (providedOtpHash !== record.otpHash) {
+      sendJson(response, 401, { message: "OTP is incorrect." });
+      return true;
+    }
+
+    await User.create({
+      name,
+      email,
+      username,
+      password,
+      stats,
+      resume,
+    });
+
+    registerOtps.delete(email);
+    sendJson(response, 201, { message: "User created." });
+    return true;
+  }
+
   if (
     request.method === "POST" &&
     (pathname === "/api/auth/reset-password" || pathname === "/api/auth/verify-otp-reset")
@@ -396,13 +538,18 @@ export const handleApiRequest = async (request, response) => {
     return true;
   }
 
+  if (request.method === "GET" && pathname === "/api/health") {
+    sendJson(response, 200, {
+      status: "ok",
+      dbReadyState: mongoose.connection.readyState,
+      mailReady: smtpReady,
+      ...(smtpLastError ? { mailError: smtpLastError } : {}),
+    });
+    return true;
+  }
+
   try {
     await connectDb();
-
-    if (request.method === "GET" && pathname === "/api/health") {
-      sendJson(response, 200, { status: "ok" });
-      return true;
-    }
 
     if (await handleUsers(request, response, pathname)) {
       return true;
@@ -424,13 +571,26 @@ export const handleApiRequest = async (request, response) => {
     const isConfigError =
       /MONGODB_URI is missing/i.test(error?.message || "") ||
       /URI|connection string|SRV|MongoParseError|Invalid scheme/i.test(error?.message || "");
-    const statusCode = isDuplicateEmail ? 409 : isInvalidObjectId ? 400 : isConfigError ? 500 : 500;
+    const isDbConnectionError =
+      /Server selection timed out|ENOTFOUND|ECONNREFUSED|ECONNRESET|timed out|querySrv|SSL|authentication failed|bad auth/i.test(
+        error?.message || "",
+      );
+    const isSmtpConfigError = /SMTP credentials are missing/i.test(error?.message || "");
+    const isSmtpSendError =
+      /EAUTH|ESOCKET|ENOTFOUND|ETIMEDOUT|Invalid login|No recipients defined/i.test(error?.message || "");
+    const statusCode = isDuplicateEmail ? 409 : isInvalidObjectId ? 400 : 500;
     const message = isDuplicateEmail
       ? "This email is already registered."
       : isInvalidObjectId
         ? "Invalid record id."
         : isConfigError
           ? `Database configuration error: ${error.message}`
+          : isDbConnectionError
+            ? `Database connection failed: ${error.message}. Check MONGODB_URI, MongoDB Atlas Network Access (IP allowlist), and database user credentials.`
+          : isSmtpConfigError
+            ? error.message
+            : isSmtpSendError
+              ? `Failed to send OTP email: ${error.message}`
           : "Database error.";
 
     sendJson(response, statusCode, { message });
