@@ -123,7 +123,7 @@ const resolveSmtpHost = async (host, forceIpv4) => {
   return address;
 };
 
-const getMailTransport = async () => {
+const getMailTransportConfigs = async () => {
   const host = (process.env.SMTP_HOST || "").trim();
   const port = Number(process.env.SMTP_PORT || "587");
   const user = (process.env.SMTP_USER || "").trim().toLowerCase();
@@ -138,11 +138,8 @@ const getMailTransport = async () => {
 
   const smtpHost = host.includes("gmail.com") ? "smtp.gmail.com" : host;
   const resolvedHost = await resolveSmtpHost(smtpHost, forceIpv4);
-  const transportConfig = {
+  const baseConfig = {
     host: resolvedHost,
-    port: host.includes("gmail.com") ? 587 : port,
-    secure: host.includes("gmail.com") ? false : port === 465,
-    requireTLS: true,
     connectionTimeout: 15000,
     greetingTimeout: 15000,
     socketTimeout: 20000,
@@ -151,37 +148,67 @@ const getMailTransport = async () => {
   };
 
   if (forceIpv4) {
-    transportConfig.family = 4;
+    baseConfig.family = 4;
   }
 
-  return nodemailer.createTransport(transportConfig);
+  if (host.includes("gmail.com")) {
+    return [
+      { ...baseConfig, port: 587, secure: false, requireTLS: true },
+      { ...baseConfig, port: 465, secure: true, requireTLS: false },
+    ];
+  }
+
+  return [{ ...baseConfig, port, secure: port === 465, requireTLS: port !== 465 }];
+};
+
+const withMailTransportRetry = async (operation) => {
+  const configs = await getMailTransportConfigs();
+  let lastError = null;
+
+  for (const config of configs) {
+    try {
+      const transporter = nodemailer.createTransport(config);
+      return await operation(transporter);
+    } catch (error) {
+      lastError = error;
+      const isNetworkError = /ENETUNREACH|ETIMEDOUT|Connection timeout|ECONNREFUSED|ESOCKET/i.test(error?.message || "");
+
+      if (!isNetworkError) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError || new Error("SMTP connection failed.");
 };
 
 export const verifySmtpConnection = async () => {
   try {
-    const transporter = await getMailTransport();
-    await transporter.verify();
+    await withMailTransportRetry((transporter) => transporter.verify());
     smtpReady = true;
     smtpLastError = "";
     return true;
   } catch (error) {
     smtpReady = false;
-    smtpLastError = error?.message || "SMTP verification failed.";
+    const rawMessage = error?.message || "SMTP verification failed.";
+    smtpLastError = /Connection timeout|ENETUNREACH|ETIMEDOUT/i.test(rawMessage)
+      ? `${rawMessage}. Outbound SMTP may be blocked on this network/host. Try a provider SMTP relay or open ports 587/465.`
+      : rawMessage;
     throw error;
   }
 };
 
 const sendOtpEmail = async ({ email, otp, subject, title }) => {
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const transporter = await getMailTransport();
-
-  await transporter.sendMail({
-    from,
-    to: email,
-    subject,
-    text: `Your OTP is ${otp}. It is valid for 10 minutes.`,
-    html: `<p>${title}</p><p>Your OTP is <strong>${otp}</strong>.</p><p>It is valid for 10 minutes.</p>`,
-  });
+  await withMailTransportRetry((transporter) =>
+    transporter.sendMail({
+      from,
+      to: email,
+      subject,
+      text: `Your OTP is ${otp}. It is valid for 10 minutes.`,
+      html: `<p>${title}</p><p>Your OTP is <strong>${otp}</strong>.</p><p>It is valid for 10 minutes.</p>`,
+    }),
+  );
 };
 
 const sendResetOtpEmail = async (email, otp) =>
