@@ -114,7 +114,9 @@ const getMailTransport = () => {
 
   if (host.includes("gmail.com")) {
     return nodemailer.createTransport({
-      service: "gmail",
+      host: "smtp.gmail.com",
+      port: 587,
+      secure: false,
       auth: { user, pass },
     });
   }
