@@ -1,6 +1,7 @@
 /* eslint-env node */
 import mongoose from "mongoose";
 import crypto from "node:crypto";
+import dns from "node:dns";
 import nodemailer from "nodemailer";
 import { Question, User, connectDb } from "./db.js";
 
@@ -43,6 +44,7 @@ const passwordResetOtps = new Map();
 const registerOtps = new Map();
 let smtpReady = false;
 let smtpLastError = "";
+let smtpHostCache = { host: "", resolvedHost: "", expiresAt: 0 };
 
 const makeOtp = () => String(Math.floor(100000 + Math.random() * 900000));
 
@@ -100,7 +102,28 @@ const readRegisterRecord = (email) => {
   return record;
 };
 
-const getMailTransport = () => {
+const resolveSmtpHost = async (host, forceIpv4) => {
+  if (!forceIpv4) {
+    return host;
+  }
+
+  const now = Date.now();
+
+  if (smtpHostCache.host === host && smtpHostCache.expiresAt > now) {
+    return smtpHostCache.resolvedHost;
+  }
+
+  const { address } = await dns.promises.lookup(host, { family: 4 });
+  smtpHostCache = {
+    host,
+    resolvedHost: address,
+    expiresAt: now + 10 * 60 * 1000,
+  };
+
+  return address;
+};
+
+const getMailTransport = async () => {
   const host = (process.env.SMTP_HOST || "").trim();
   const port = Number(process.env.SMTP_PORT || "587");
   const user = (process.env.SMTP_USER || "").trim().toLowerCase();
@@ -113,14 +136,17 @@ const getMailTransport = () => {
     throw new Error("SMTP credentials are missing. Add SMTP_HOST, SMTP_PORT, SMTP_USER and SMTP_PASS in backend/.env.");
   }
 
+  const smtpHost = host.includes("gmail.com") ? "smtp.gmail.com" : host;
+  const resolvedHost = await resolveSmtpHost(smtpHost, forceIpv4);
   const transportConfig = {
-    host: host.includes("gmail.com") ? "smtp.gmail.com" : host,
+    host: resolvedHost,
     port: host.includes("gmail.com") ? 587 : port,
     secure: host.includes("gmail.com") ? false : port === 465,
     requireTLS: true,
     connectionTimeout: 15000,
     greetingTimeout: 15000,
     socketTimeout: 20000,
+    tls: { servername: smtpHost },
     auth: { user, pass },
   };
 
@@ -133,7 +159,7 @@ const getMailTransport = () => {
 
 export const verifySmtpConnection = async () => {
   try {
-    const transporter = getMailTransport();
+    const transporter = await getMailTransport();
     await transporter.verify();
     smtpReady = true;
     smtpLastError = "";
@@ -147,7 +173,7 @@ export const verifySmtpConnection = async () => {
 
 const sendOtpEmail = async ({ email, otp, subject, title }) => {
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const transporter = getMailTransport();
+  const transporter = await getMailTransport();
 
   await transporter.sendMail({
     from,
