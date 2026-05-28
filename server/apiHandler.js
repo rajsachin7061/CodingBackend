@@ -1,8 +1,6 @@
 /* eslint-env node */
 import mongoose from "mongoose";
 import crypto from "node:crypto";
-import dns from "node:dns";
-import nodemailer from "nodemailer";
 import { Question, User, connectDb } from "./db.js";
 
 const sendJson = (response, statusCode, payload) => {
@@ -44,7 +42,7 @@ const passwordResetOtps = new Map();
 const registerOtps = new Map();
 let smtpReady = false;
 let smtpLastError = "";
-let smtpHostCache = { host: "", resolvedHost: "", expiresAt: 0 };
+const mailProvider = (process.env.MAIL_PROVIDER || "resend").trim().toLowerCase();
 
 const makeOtp = () => String(Math.floor(100000 + Math.random() * 900000));
 
@@ -102,113 +100,66 @@ const readRegisterRecord = (email) => {
   return record;
 };
 
-const resolveSmtpHost = async (host, forceIpv4) => {
-  if (!forceIpv4) {
-    return host;
+const sendWithResend = async ({ email, subject, html, text }) => {
+  const apiKey = (process.env.RESEND_API_KEY || "").trim();
+  const from = (process.env.RESEND_FROM || process.env.SMTP_FROM || "").trim();
+
+  if (!apiKey || !from) {
+    throw new Error("Resend is not configured. Add RESEND_API_KEY and RESEND_FROM in backend/.env.");
   }
 
-  const now = Date.now();
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from,
+      to: [email],
+      subject,
+      html,
+      text,
+    }),
+  });
 
-  if (smtpHostCache.host === host && smtpHostCache.expiresAt > now) {
-    return smtpHostCache.resolvedHost;
+  if (!response.ok) {
+    const payload = await response.text();
+    throw new Error(`Resend API error (${response.status}): ${payload}`);
   }
-
-  const { address } = await dns.promises.lookup(host, { family: 4 });
-  smtpHostCache = {
-    host,
-    resolvedHost: address,
-    expiresAt: now + 10 * 60 * 1000,
-  };
-
-  return address;
 };
 
-const getMailTransportConfigs = async () => {
-  const host = (process.env.SMTP_HOST || "").trim();
-  const port = Number(process.env.SMTP_PORT || "587");
-  const user = (process.env.SMTP_USER || "").trim().toLowerCase();
-  const rawPass = (process.env.SMTP_PASS || "").trim();
-  const forceIpv4 = (process.env.SMTP_FORCE_IPV4 || "true").trim().toLowerCase() !== "false";
-  // Google App Passwords are often copied with spaces ("xxxx xxxx xxxx xxxx").
-  const pass = host.includes("gmail.com") ? rawPass.replace(/\s+/g, "") : rawPass;
-
-  if (!host || !user || !pass) {
-    throw new Error("SMTP credentials are missing. Add SMTP_HOST, SMTP_PORT, SMTP_USER and SMTP_PASS in backend/.env.");
-  }
-
-  const smtpHost = host.includes("gmail.com") ? "smtp.gmail.com" : host;
-  const resolvedHost = await resolveSmtpHost(smtpHost, forceIpv4);
-  const baseConfig = {
-    host: resolvedHost,
-    connectionTimeout: 15000,
-    greetingTimeout: 15000,
-    socketTimeout: 20000,
-    tls: { servername: smtpHost },
-    auth: { user, pass },
-  };
-
-  if (forceIpv4) {
-    baseConfig.family = 4;
-  }
-
-  if (host.includes("gmail.com")) {
-    return [
-      { ...baseConfig, port: 587, secure: false, requireTLS: true },
-      { ...baseConfig, port: 465, secure: true, requireTLS: false },
-    ];
-  }
-
-  return [{ ...baseConfig, port, secure: port === 465, requireTLS: port !== 465 }];
-};
-
-const withMailTransportRetry = async (operation) => {
-  const configs = await getMailTransportConfigs();
-  let lastError = null;
-
-  for (const config of configs) {
-    try {
-      const transporter = nodemailer.createTransport(config);
-      return await operation(transporter);
-    } catch (error) {
-      lastError = error;
-      const isNetworkError = /ENETUNREACH|ETIMEDOUT|Connection timeout|ECONNREFUSED|ESOCKET/i.test(error?.message || "");
-
-      if (!isNetworkError) {
-        throw error;
-      }
-    }
-  }
-
-  throw lastError || new Error("SMTP connection failed.");
+const isResendConfigured = () => {
+  const apiKey = (process.env.RESEND_API_KEY || "").trim();
+  const from = (process.env.RESEND_FROM || process.env.SMTP_FROM || "").trim();
+  return Boolean(apiKey && from);
 };
 
 export const verifySmtpConnection = async () => {
   try {
-    await withMailTransportRetry((transporter) => transporter.verify());
+    if (mailProvider !== "resend") {
+      throw new Error("Unsupported MAIL_PROVIDER. Set MAIL_PROVIDER=resend.");
+    }
+    const apiKey = (process.env.RESEND_API_KEY || "").trim();
+    const from = (process.env.RESEND_FROM || process.env.SMTP_FROM || "").trim();
+    if (!apiKey || !from) {
+      throw new Error("Resend is not configured. Add RESEND_API_KEY and RESEND_FROM in backend/.env.");
+    }
     smtpReady = true;
     smtpLastError = "";
     return true;
   } catch (error) {
     smtpReady = false;
-    const rawMessage = error?.message || "SMTP verification failed.";
-    smtpLastError = /Connection timeout|ENETUNREACH|ETIMEDOUT/i.test(rawMessage)
-      ? `${rawMessage}. Outbound SMTP may be blocked on this network/host. Try a provider SMTP relay or open ports 587/465.`
-      : rawMessage;
+    smtpLastError = error?.message || "Resend verification failed.";
     throw error;
   }
 };
 
 const sendOtpEmail = async ({ email, otp, subject, title }) => {
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  await withMailTransportRetry((transporter) =>
-    transporter.sendMail({
-      from,
-      to: email,
-      subject,
-      text: `Your OTP is ${otp}. It is valid for 10 minutes.`,
-      html: `<p>${title}</p><p>Your OTP is <strong>${otp}</strong>.</p><p>It is valid for 10 minutes.</p>`,
-    }),
-  );
+  const text = `Your OTP is ${otp}. It is valid for 10 minutes.`;
+  const html = `<p>${title}</p><p>Your OTP is <strong>${otp}</strong>.</p><p>It is valid for 10 minutes.</p>`;
+
+  await sendWithResend({ email, subject, html, text });
 };
 
 const sendResetOtpEmail = async (email, otp) =>
@@ -632,9 +583,7 @@ export const handleApiRequest = async (request, response) => {
       /Server selection timed out|ENOTFOUND|ECONNREFUSED|ECONNRESET|timed out|querySrv|SSL|authentication failed|bad auth/i.test(
         error?.message || "",
       );
-    const isSmtpConfigError = /SMTP credentials are missing/i.test(error?.message || "");
-    const isSmtpSendError =
-      /EAUTH|ESOCKET|ENOTFOUND|ETIMEDOUT|Invalid login|No recipients defined/i.test(error?.message || "");
+    const isResendError = /Resend API error|Resend is not configured/i.test(error?.message || "");
     const statusCode = isDuplicateEmail ? 409 : isInvalidObjectId ? 400 : 500;
     const message = isDuplicateEmail
       ? "This email is already registered."
@@ -644,10 +593,8 @@ export const handleApiRequest = async (request, response) => {
           ? `Database configuration error: ${error.message}`
           : isDbConnectionError
             ? `Database connection failed: ${error.message}. Check MONGODB_URI, MongoDB Atlas Network Access (IP allowlist), and database user credentials.`
-          : isSmtpConfigError
-            ? error.message
-            : isSmtpSendError
-              ? `Failed to send OTP email: ${error.message}`
+          : isResendError
+            ? `Email delivery failed: ${error.message}`
           : "Database error.";
 
     sendJson(response, statusCode, { message });
