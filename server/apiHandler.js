@@ -39,7 +39,6 @@ const readRequestJson = async (request) =>
 
 const RESET_OTP_EXPIRY_MS = 10 * 60 * 1000;
 const passwordResetOtps = new Map();
-const registerOtps = new Map();
 let smtpReady = false;
 let smtpLastError = "";
 const mailProvider = (process.env.MAIL_PROVIDER || "resend").trim().toLowerCase();
@@ -67,33 +66,6 @@ const readResetRecord = (email) => {
 
   if (Date.now() > record.expiresAt) {
     passwordResetOtps.delete(email);
-    return null;
-  }
-
-  return record;
-};
-
-const createRegisterRecord = (email) => {
-  const otp = makeOtp();
-  const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
-
-  registerOtps.set(email, {
-    otpHash,
-    expiresAt: Date.now() + RESET_OTP_EXPIRY_MS,
-  });
-
-  return otp;
-};
-
-const readRegisterRecord = (email) => {
-  const record = registerOtps.get(email);
-
-  if (!record) {
-    return null;
-  }
-
-  if (Date.now() > record.expiresAt) {
-    registerOtps.delete(email);
     return null;
   }
 
@@ -168,14 +140,6 @@ const sendResetOtpEmail = async (email, otp) =>
     otp,
     subject: "Online Quiz password reset OTP",
     title: "Use this OTP to reset your password.",
-  });
-
-const sendRegisterOtpEmail = async (email, otp) =>
-  sendOtpEmail({
-    email,
-    otp,
-    subject: "Online Quiz email verification OTP",
-    title: "Use this OTP to verify your email and complete registration.",
   });
 
 const normalizeUser = (doc) => ({
@@ -360,79 +324,6 @@ const handleAuth = async (request, response, pathname) => {
     await sendResetOtpEmail(email, otp);
 
     sendJson(response, 200, { message: "OTP sent to your email." });
-    return true;
-  }
-
-  if (request.method === "POST" && pathname === "/api/auth/request-register-otp") {
-    const body = await readRequestJson(request);
-    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
-
-    if (!email) {
-      sendJson(response, 400, { message: "Email is required." });
-      return true;
-    }
-
-    const existingUser = await User.findOne({ email });
-
-    if (existingUser) {
-      sendJson(response, 409, { message: "This email is already registered." });
-      return true;
-    }
-
-    const otp = createRegisterRecord(email);
-    await sendRegisterOtpEmail(email, otp);
-
-    sendJson(response, 200, { message: "Verification OTP sent to your email." });
-    return true;
-  }
-
-  if (request.method === "POST" && pathname === "/api/auth/register-with-otp") {
-    const body = await readRequestJson(request);
-    const name = typeof body.name === "string" ? body.name.trim() : "";
-    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
-    const password = typeof body.password === "string" ? body.password : "";
-    const username = typeof body.username === "string" ? body.username.trim() : "";
-    const otp = typeof body.otp === "string" ? body.otp.trim() : "";
-    const stats = body.stats || {};
-    const resume = body.resume || {};
-
-    if (!name || !email || !password || !otp) {
-      sendJson(response, 400, { message: "Name, email, password and OTP are required." });
-      return true;
-    }
-
-    const existingUser = await User.findOne({ email });
-
-    if (existingUser) {
-      sendJson(response, 409, { message: "This email is already registered." });
-      return true;
-    }
-
-    const record = readRegisterRecord(email);
-
-    if (!record) {
-      sendJson(response, 400, { message: "OTP expired or not requested. Please request a new OTP." });
-      return true;
-    }
-
-    const providedOtpHash = crypto.createHash("sha256").update(otp).digest("hex");
-
-    if (providedOtpHash !== record.otpHash) {
-      sendJson(response, 401, { message: "OTP is incorrect." });
-      return true;
-    }
-
-    await User.create({
-      name,
-      email,
-      username,
-      password,
-      stats,
-      resume,
-    });
-
-    registerOtps.delete(email);
-    sendJson(response, 201, { message: "User created." });
     return true;
   }
 
