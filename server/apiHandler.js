@@ -1,7 +1,7 @@
 /* eslint-env node */
 import mongoose from "mongoose";
 import crypto from "node:crypto";
-import { Question, User, connectDb } from "./db.js";
+import { ContestSettings, Question, User, connectDb } from "./db.js";
 
 const sendJson = (response, statusCode, payload) => {
   response.writeHead(statusCode, {
@@ -162,8 +162,22 @@ const normalizeQuestion = (doc) => ({
   question: doc.question,
   options: Array.isArray(doc.options) ? doc.options : [],
   answer: doc.answer,
+  section: doc.section || "both",
   createdAt: doc.createdAt,
   updatedAt: doc.updatedAt,
+});
+
+const normalizeContestSettings = (doc) => ({
+  contestName: doc?.contestName?.trim() || "Weekly Contest",
+  contestQuestionCount: doc?.contestQuestionCount ?? 10,
+  contestDurationSeconds:
+    doc?.contestDurationSeconds ??
+    ((doc?.contestQuestionCount ?? 10) * (doc?.contestSecondsPerQuestion ?? 20)),
+  isScheduled: Boolean(doc?.isScheduled),
+  startAt: doc?.startAt || null,
+  endAt: doc?.endAt || null,
+  selectedQuestionIds: Array.isArray(doc?.selectedQuestionIds) ? doc.selectedQuestionIds : [],
+  showLeaderboardToUsers: Boolean(doc?.showLeaderboardToUsers),
 });
 
 const getIdFromPath = (pathname, resource) => {
@@ -382,7 +396,7 @@ const handleQuestions = async (request, response, pathname) => {
 
   if (request.method === "POST" && pathname === "/api/questions") {
     const body = await readRequestJson(request);
-    const { category = "", question = "", options = [], answer = "" } = body;
+    const { category = "", question = "", options = [], answer = "", section = "both" } = body;
 
     if (!category.trim() || !question.trim() || !Array.isArray(options) || options.length < 2 || !answer.trim()) {
       sendJson(response, 400, {
@@ -396,6 +410,7 @@ const handleQuestions = async (request, response, pathname) => {
       question: question.trim(),
       options: options.map((item) => String(item).trim()).filter(Boolean),
       answer: answer.trim(),
+      section: ["quiz", "contest", "both"].includes(section) ? section : "both",
     });
 
     sendJson(response, 201, { message: "Question created." });
@@ -403,6 +418,46 @@ const handleQuestions = async (request, response, pathname) => {
   }
 
   const questionId = getIdFromPath(pathname, "questions");
+
+  if (request.method === "PATCH" && questionId) {
+    const body = await readRequestJson(request);
+    const updates = {};
+
+    if (typeof body.category === "string") {
+      updates.category = body.category.trim();
+    }
+
+    if (typeof body.question === "string") {
+      updates.question = body.question.trim();
+    }
+
+    if (Array.isArray(body.options)) {
+      updates.options = body.options.map((item) => String(item).trim()).filter(Boolean);
+    }
+
+    if (typeof body.answer === "string") {
+      updates.answer = body.answer.trim();
+    }
+
+    if (typeof body.section === "string") {
+      updates.section = ["quiz", "contest", "both"].includes(body.section) ? body.section : "both";
+    }
+
+    if (!Object.keys(updates).length) {
+      sendJson(response, 400, { message: "No valid fields provided." });
+      return true;
+    }
+
+    const updatedQuestion = await Question.findByIdAndUpdate(questionId, updates, { new: true });
+
+    if (!updatedQuestion) {
+      sendJson(response, 404, { message: "Question not found." });
+      return true;
+    }
+
+    sendJson(response, 200, { message: "Question updated.", question: normalizeQuestion(updatedQuestion) });
+    return true;
+  }
 
   if (request.method === "DELETE" && questionId) {
     const deletedQuestion = await Question.findByIdAndDelete(questionId);
@@ -413,6 +468,77 @@ const handleQuestions = async (request, response, pathname) => {
     }
 
     sendJson(response, 200, { message: "Question deleted." });
+    return true;
+  }
+
+  return false;
+};
+
+const getContestSettingsDoc = async () => {
+  const existing = await ContestSettings.findOne({ key: "default" });
+
+  if (existing) {
+    return existing;
+  }
+
+  return ContestSettings.create({ key: "default" });
+};
+
+const handleContestSettings = async (request, response, pathname) => {
+  if (pathname !== "/api/contest-settings") {
+    return false;
+  }
+
+  if (request.method === "GET") {
+    const settingsDoc = await getContestSettingsDoc();
+    sendJson(response, 200, normalizeContestSettings(settingsDoc));
+    return true;
+  }
+
+  if (request.method === "PATCH") {
+    const body = await readRequestJson(request);
+    const updates = {};
+
+    if ("contestName" in body) {
+      const name = typeof body.contestName === "string" ? body.contestName.trim() : "";
+      updates.contestName = name || "Weekly Contest";
+    }
+
+    if (typeof body.contestQuestionCount === "number") {
+      updates.contestQuestionCount = Math.max(1, Math.min(100, Math.floor(body.contestQuestionCount)));
+    }
+
+    if (typeof body.contestDurationSeconds === "number") {
+      updates.contestDurationSeconds = Math.max(30, Math.min(14400, Math.floor(body.contestDurationSeconds)));
+    }
+
+    if (typeof body.isScheduled === "boolean") {
+      updates.isScheduled = body.isScheduled;
+    }
+
+    if ("startAt" in body) {
+      updates.startAt = body.startAt ? new Date(body.startAt) : null;
+    }
+
+    if ("endAt" in body) {
+      updates.endAt = body.endAt ? new Date(body.endAt) : null;
+    }
+
+    if (Array.isArray(body.selectedQuestionIds)) {
+      updates.selectedQuestionIds = body.selectedQuestionIds
+        .map((item) => (typeof item === "string" ? item.trim() : ""))
+        .filter(Boolean);
+    }
+
+    if (typeof body.showLeaderboardToUsers === "boolean") {
+      updates.showLeaderboardToUsers = body.showLeaderboardToUsers;
+    }
+
+    const settingsDoc = await getContestSettingsDoc();
+    Object.assign(settingsDoc, updates);
+    await settingsDoc.save();
+
+    sendJson(response, 200, { message: "Contest settings updated.", settings: normalizeContestSettings(settingsDoc) });
     return true;
   }
 
@@ -459,6 +585,10 @@ export const handleApiRequest = async (request, response) => {
     }
 
     if (await handleQuestions(request, response, pathname)) {
+      return true;
+    }
+
+    if (await handleContestSettings(request, response, pathname)) {
       return true;
     }
 
