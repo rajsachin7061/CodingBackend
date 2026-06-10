@@ -10,7 +10,7 @@ import { handlePageRequest } from "./server/pageHandler.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, ".env") });
-const distPath = path.join(__dirname, "..", "frontend", "dist");
+const distPath = path.join(__dirname, "..", "CodingFrontend", "dist");
 const port = process.env.PORT || 3001;
 
 const server = http.createServer(async (request, response) => {
