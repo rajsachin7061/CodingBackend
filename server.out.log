@@ -1,2 +1,12 @@
-◇ injected env (7) from .env // tip: ⌘ suppress logs { quiet: true }
+
+> online-quiz-backend@1.0.0 dev
+> nodemon server.js
+
+[33m[nodemon] 3.1.14[39m
+[33m[nodemon] to restart at any time, enter `rs`[39m
+[33m[nodemon] watching path(s): *.*[39m
+[33m[nodemon] watching extensions: js,mjs,cjs,json[39m
+[32m[nodemon] starting `node server.js`[39m
+◇ injected env (10) from .env // tip: ⌘ override existing { override: true }
 Online Quiz running at http://localhost:3001
+SMTP connected successfully.
