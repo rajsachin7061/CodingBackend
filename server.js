@@ -3,7 +3,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
-import { handleApiRequest, verifySmtpConnection } from "./server/apiHandler.js";
+import { handleApiRequest, verifyResendConnection } from "./server/apiHandler.js";
 import { connectDb } from "./server/db.js";
 import { handlePageRequest } from "./server/pageHandler.js";
 
@@ -43,11 +43,11 @@ server.listen(port, () => {
       console.error("Database connection error:", error.message);
     });
 
-  verifySmtpConnection()
+  verifyResendConnection()
     .then(() => {
-      console.log("SMTP connected successfully.");
+      console.log("Resend mail configured successfully.");
     })
     .catch((error) => {
-      console.error("SMTP connection error:", error.message);
+      console.error("Resend mail configuration error:", error.message);
     });
 });
