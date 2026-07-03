@@ -1,6 +1,7 @@
 /* eslint-env node */
 import mongoose from "mongoose";
 import crypto from "node:crypto";
+import nodemailer from "nodemailer";
 import { Resend } from "resend";
 import { ContestSettings, Question, User, connectDb } from "./db.js";
 
@@ -40,6 +41,10 @@ const readRequestJson = async (request) =>
 
 const RESET_OTP_EXPIRY_MS = 10 * 60 * 1000;
 const passwordResetOtps = new Map();
+let smtpReady = false;
+let smtpLastError = "";
+const mailProvider = (process.env.MAIL_PROVIDER || "resend").trim().toLowerCase();
+let smtpTransporter = null;
 let mailReady = false;
 let mailLastError = "";
 let resendClient = null;
@@ -116,6 +121,12 @@ const sendWithResend = async ({ email, subject, html, text }) => {
     html,
     text,
   });
+};
+
+const isResendConfigured = () => {
+  const apiKey = (process.env.RESEND_API_KEY || "").trim();
+  const from = (process.env.RESEND_FROM || process.env.SMTP_FROM || "").trim();
+  return Boolean(apiKey && from);
 
   if (error) {
     throw new Error(`Resend API error: ${error.message}`);
@@ -124,6 +135,28 @@ const sendWithResend = async ({ email, subject, html, text }) => {
 
 export const verifyResendConnection = async () => {
   try {
+    if (mailProvider === "smtp") {
+      await createSmtpTransporter().verify();
+      smtpReady = true;
+      smtpLastError = "";
+      return true;
+    }
+
+    if (mailProvider === "resend") {
+      const apiKey = (process.env.RESEND_API_KEY || "").trim();
+      const from = (process.env.RESEND_FROM || process.env.SMTP_FROM || "").trim();
+      if (!apiKey || !from) {
+        throw new Error("Resend is not configured. Add RESEND_API_KEY and RESEND_FROM in backend/.env.");
+      }
+      smtpReady = true;
+      smtpLastError = "";
+      return true;
+    }
+
+    throw new Error("Unsupported MAIL_PROVIDER. Set MAIL_PROVIDER=smtp or MAIL_PROVIDER=resend.");
+  } catch (error) {
+    smtpReady = false;
+    smtpLastError = error?.message || "Mail verification failed.";
     getResendClient();
 
     const from = (process.env.RESEND_FROM || "").trim();
@@ -147,11 +180,17 @@ const sendOtpEmail = async ({ email, otp, subject, title }) => {
   const text = `Your OTP is ${otp}. It is valid for 10 minutes.`;
   const html = `<p>${title}</p><p>Your OTP is <strong>${otp}</strong>.</p><p>It is valid for 10 minutes.</p>`;
 
+  if (mailProvider === "smtp") {
+    await sendWithSmtp({ email, subject, html, text });
+    return;
+  }
+
   await sendWithResend({ email, subject, html, text });
 };
 
 const sendResetOtpEmail = async (email, otp) =>
   sendOtpEmail({
+     from: "Quiz App <noreply@yourdomain.com>",
     email,
     otp,
     subject: "Online Quiz password reset OTP",
