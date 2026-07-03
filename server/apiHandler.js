@@ -2,6 +2,7 @@
 import mongoose from "mongoose";
 import crypto from "node:crypto";
 import nodemailer from "nodemailer";
+import { Resend } from "resend";
 import { ContestSettings, Question, User, connectDb } from "./db.js";
 
 const sendJson = (response, statusCode, payload) => {
@@ -44,6 +45,19 @@ let smtpReady = false;
 let smtpLastError = "";
 const mailProvider = (process.env.MAIL_PROVIDER || "resend").trim().toLowerCase();
 let smtpTransporter = null;
+let mailReady = false;
+let mailLastError = "";
+let resendClient = null;
+const PISTON_API_URL = (
+  process.env.PISTON_API_URL || "https://emkc.org/api/v2/piston"
+).replace(/\/+$/, "");
+const compilerRuntimeAliases = {
+  cpp: ["c++", "cpp"],
+  java: ["java"],
+  python: ["python", "python3"],
+};
+let compilerRuntimesCache = null;
+let compilerRuntimesLoadedAt = 0;
 
 const makeOtp = () => String(Math.floor(100000 + Math.random() * 900000));
 
@@ -74,69 +88,35 @@ const readResetRecord = (email) => {
   return record;
 };
 
-const sendWithResend = async ({ email, subject, html, text }) => {
+const getResendClient = () => {
   const apiKey = (process.env.RESEND_API_KEY || "").trim();
-  const from = (process.env.RESEND_FROM || process.env.SMTP_FROM || "").trim();
 
-  if (!apiKey || !from) {
-    throw new Error("Resend is not configured. Add RESEND_API_KEY and RESEND_FROM in backend/.env.");
+  if (!apiKey) {
+    throw new Error(
+      "Resend is not configured. Add RESEND_API_KEY in backend/.env.",
+    );
   }
 
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from,
-      to: [email],
-      subject,
-      html,
-      text,
-    }),
-  });
-
-  if (!response.ok) {
-    const payload = await response.text();
-    throw new Error(`Resend API error (${response.status}): ${payload}`);
+  if (!resendClient) {
+    resendClient = new Resend(apiKey);
   }
+
+  return resendClient;
 };
 
-const createSmtpTransporter = () => {
-  if (smtpTransporter) {
-    return smtpTransporter;
-  }
-
-  const host = (process.env.SMTP_HOST || "").trim();
-  const port = Number(process.env.SMTP_PORT || 465);
-  const user = (process.env.SMTP_USER || "").trim();
-  const pass = (process.env.SMTP_PASS || "").trim();
-
-  if (!host || !port || !user || !pass) {
-    throw new Error("SMTP is not configured. Add SMTP_HOST, SMTP_PORT, SMTP_USER and SMTP_PASS in backend/.env.");
-  }
-
-  smtpTransporter = nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    auth: { user, pass },
-  });
-
-  return smtpTransporter;
-};
-
-const sendWithSmtp = async ({ email, subject, html, text }) => {
-  const from = (process.env.SMTP_FROM || process.env.SMTP_USER || "").trim();
+const sendWithResend = async ({ email, subject, html, text }) => {
+  const from = (process.env.RESEND_FROM || "").trim();
 
   if (!from) {
-    throw new Error("SMTP_FROM is not configured. Add SMTP_FROM in backend/.env.");
+    throw new Error(
+      "Resend is not configured. Add RESEND_FROM in backend/.env.",
+    );
   }
 
-  await createSmtpTransporter().sendMail({
+  const resend = getResendClient();
+  const { error } = await resend.emails.send({
     from,
-    to: email,
+    to: [email],
     subject,
     html,
     text,
@@ -147,9 +127,13 @@ const isResendConfigured = () => {
   const apiKey = (process.env.RESEND_API_KEY || "").trim();
   const from = (process.env.RESEND_FROM || process.env.SMTP_FROM || "").trim();
   return Boolean(apiKey && from);
+
+  if (error) {
+    throw new Error(`Resend API error: ${error.message}`);
+  }
 };
 
-export const verifySmtpConnection = async () => {
+export const verifyResendConnection = async () => {
   try {
     if (mailProvider === "smtp") {
       await createSmtpTransporter().verify();
@@ -173,6 +157,21 @@ export const verifySmtpConnection = async () => {
   } catch (error) {
     smtpReady = false;
     smtpLastError = error?.message || "Mail verification failed.";
+    getResendClient();
+
+    const from = (process.env.RESEND_FROM || "").trim();
+    if (!from) {
+      throw new Error(
+        "Resend is not configured. Add RESEND_FROM in backend/.env.",
+      );
+    }
+
+    mailReady = true;
+    mailLastError = "";
+    return true;
+  } catch (error) {
+    mailReady = false;
+    mailLastError = error?.message || "Resend verification failed.";
     throw error;
   }
 };
@@ -197,6 +196,118 @@ const sendResetOtpEmail = async (email, otp) =>
     subject: "Online Quiz password reset OTP",
     title: "Use this OTP to reset your password.",
   });
+
+const getCompilerRuntimes = async () => {
+  const cacheAgeMs = Date.now() - compilerRuntimesLoadedAt;
+
+  if (compilerRuntimesCache && cacheAgeMs < 30 * 60 * 1000) {
+    return compilerRuntimesCache;
+  }
+
+  const response = await fetch(`${PISTON_API_URL}/runtimes`);
+
+  if (!response.ok) {
+    throw new Error("Compiler service runtimes could not be loaded.");
+  }
+
+  compilerRuntimesCache = await response.json();
+  compilerRuntimesLoadedAt = Date.now();
+  return compilerRuntimesCache;
+};
+
+const resolveCompilerRuntime = async (language) => {
+  const aliases = compilerRuntimeAliases[language] || [];
+  const runtimes = await getCompilerRuntimes();
+
+  return runtimes.find((runtime) =>
+    aliases.some(
+      (alias) => runtime.language === alias || runtime.aliases?.includes(alias),
+    ),
+  );
+};
+
+const handleCompile = async (request, response, pathname) => {
+  if (pathname !== "/api/compile") {
+    return false;
+  }
+
+  if (request.method !== "POST") {
+    sendJson(response, 405, { message: "Use POST to run code." });
+    return true;
+  }
+
+  const body = await readRequestJson(request);
+  const language = String(body.language || "")
+    .trim()
+    .toLowerCase();
+  const code = String(body.code || "");
+  const stdin = String(body.stdin || "");
+
+  if (!compilerRuntimeAliases[language]) {
+    sendJson(response, 400, {
+      message: "Supported server languages: python, java, cpp.",
+    });
+    return true;
+  }
+
+  if (!code.trim()) {
+    sendJson(response, 400, { message: "Please enter code to run." });
+    return true;
+  }
+
+  if (code.length > 20000 || stdin.length > 5000) {
+    sendJson(response, 413, { message: "Code or input is too large." });
+    return true;
+  }
+
+  const runtime = await resolveCompilerRuntime(language);
+
+  if (!runtime) {
+    sendJson(response, 503, {
+      message: `${language} runtime is not available right now.`,
+    });
+    return true;
+  }
+
+  const compileResponse = await fetch(`${PISTON_API_URL}/execute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      language: runtime.language,
+      version: runtime.version,
+      files: [{ content: code }],
+      stdin,
+    }),
+  });
+
+  const payload = await compileResponse.json().catch(() => ({}));
+
+  if (!compileResponse.ok) {
+    sendJson(response, compileResponse.status, {
+      message: payload.message || "Compiler service could not run this code.",
+    });
+    return true;
+  }
+
+  const runOutput = payload.run || {};
+  const compileOutput = payload.compile || {};
+  const output = [
+    compileOutput.stdout,
+    compileOutput.stderr,
+    runOutput.stdout,
+    runOutput.stderr,
+  ]
+    .filter(Boolean)
+    .join("");
+
+  sendJson(response, 200, {
+    output: output || "Code ran successfully with no output.",
+    code: runOutput.code ?? compileOutput.code ?? 0,
+    signal: runOutput.signal || compileOutput.signal || null,
+    runtime: `${runtime.language} ${runtime.version}`,
+  });
+  return true;
+};
 
 const normalizeUser = (doc) => ({
   id: doc._id.toString(),
@@ -228,16 +339,20 @@ const normalizeContestSettings = (doc) => ({
   contestQuestionCount: doc?.contestQuestionCount ?? 10,
   contestDurationSeconds:
     doc?.contestDurationSeconds ??
-    ((doc?.contestQuestionCount ?? 10) * (doc?.contestSecondsPerQuestion ?? 20)),
+    (doc?.contestQuestionCount ?? 10) * (doc?.contestSecondsPerQuestion ?? 20),
   isScheduled: Boolean(doc?.isScheduled),
   startAt: doc?.startAt || null,
   endAt: doc?.endAt || null,
-  selectedQuestionIds: Array.isArray(doc?.selectedQuestionIds) ? doc.selectedQuestionIds : [],
+  selectedQuestionIds: Array.isArray(doc?.selectedQuestionIds)
+    ? doc.selectedQuestionIds
+    : [],
   showLeaderboardToUsers: Boolean(doc?.showLeaderboardToUsers),
 });
 
 const getIdFromPath = (pathname, resource) => {
-  const match = pathname.match(new RegExp(`^/api/${resource}/([a-fA-F0-9]{24})$`));
+  const match = pathname.match(
+    new RegExp(`^/api/${resource}/([a-fA-F0-9]{24})$`),
+  );
   return match ? match[1] : null;
 };
 
@@ -262,7 +377,9 @@ const handleUsers = async (request, response, pathname) => {
     } = body;
 
     if (!name.trim() || !email.trim() || !password) {
-      sendJson(response, 400, { message: "name, email and password are required." });
+      sendJson(response, 400, {
+        message: "name, email and password are required.",
+      });
       return true;
     }
 
@@ -285,7 +402,16 @@ const handleUsers = async (request, response, pathname) => {
 
   if (request.method === "PATCH" && userId) {
     const body = await readRequestJson(request);
-    const allowedFields = ["name", "email", "username", "password", "photo", "blocked", "stats", "resume"];
+    const allowedFields = [
+      "name",
+      "email",
+      "username",
+      "password",
+      "photo",
+      "blocked",
+      "stats",
+      "resume",
+    ];
     const updates = {};
 
     allowedFields.forEach((field) => {
@@ -318,14 +444,19 @@ const handleUsers = async (request, response, pathname) => {
       return true;
     }
 
-    const updatedUser = await User.findByIdAndUpdate(userId, updates, { new: true });
+    const updatedUser = await User.findByIdAndUpdate(userId, updates, {
+      new: true,
+    });
 
     if (!updatedUser) {
       sendJson(response, 404, { message: "User not found." });
       return true;
     }
 
-    sendJson(response, 200, { message: "User updated.", user: normalizeUser(updatedUser) });
+    sendJson(response, 200, {
+      message: "User updated.",
+      user: normalizeUser(updatedUser),
+    });
     return true;
   }
 
@@ -347,7 +478,8 @@ const handleUsers = async (request, response, pathname) => {
 const handleAuth = async (request, response, pathname) => {
   if (request.method === "POST" && pathname === "/api/auth/login") {
     const body = await readRequestJson(request);
-    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+    const email =
+      typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
     const password = typeof body.password === "string" ? body.password : "";
 
     if (!email || !password) {
@@ -363,20 +495,27 @@ const handleAuth = async (request, response, pathname) => {
     }
 
     if (user.blocked) {
-      sendJson(response, 403, { message: "Your account is blocked. Please contact the admin." });
+      sendJson(response, 403, {
+        message: "Your account is blocked. Please contact the admin.",
+      });
       return true;
     }
 
-    sendJson(response, 200, { message: "Login successful.", user: normalizeUser(user) });
+    sendJson(response, 200, {
+      message: "Login successful.",
+      user: normalizeUser(user),
+    });
     return true;
   }
 
   if (
     request.method === "POST" &&
-    (pathname === "/api/auth/request-password-reset" || pathname === "/api/auth/send-otp")
+    (pathname === "/api/auth/request-password-reset" ||
+      pathname === "/api/auth/send-otp")
   ) {
     const body = await readRequestJson(request);
-    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+    const email =
+      typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
 
     if (!email) {
       sendJson(response, 400, { message: "Email is required." });
@@ -399,15 +538,19 @@ const handleAuth = async (request, response, pathname) => {
 
   if (
     request.method === "POST" &&
-    (pathname === "/api/auth/reset-password" || pathname === "/api/auth/verify-otp-reset")
+    (pathname === "/api/auth/reset-password" ||
+      pathname === "/api/auth/verify-otp-reset")
   ) {
     const body = await readRequestJson(request);
-    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+    const email =
+      typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
     const otp = typeof body.otp === "string" ? body.otp.trim() : "";
     const password = typeof body.password === "string" ? body.password : "";
 
     if (!email || !otp || !password) {
-      sendJson(response, 400, { message: "Email, OTP and new password are required." });
+      sendJson(response, 400, {
+        message: "Email, OTP and new password are required.",
+      });
       return true;
     }
 
@@ -421,11 +564,16 @@ const handleAuth = async (request, response, pathname) => {
     const record = readResetRecord(email);
 
     if (!record) {
-      sendJson(response, 400, { message: "OTP expired or not requested. Please request a new OTP." });
+      sendJson(response, 400, {
+        message: "OTP expired or not requested. Please request a new OTP.",
+      });
       return true;
     }
 
-    const providedOtpHash = crypto.createHash("sha256").update(otp).digest("hex");
+    const providedOtpHash = crypto
+      .createHash("sha256")
+      .update(otp)
+      .digest("hex");
 
     if (providedOtpHash !== record.otpHash) {
       sendJson(response, 401, { message: "OTP is incorrect." });
@@ -452,9 +600,21 @@ const handleQuestions = async (request, response, pathname) => {
 
   if (request.method === "POST" && pathname === "/api/questions") {
     const body = await readRequestJson(request);
-    const { category = "", question = "", options = [], answer = "", section = "both" } = body;
+    const {
+      category = "",
+      question = "",
+      options = [],
+      answer = "",
+      section = "both",
+    } = body;
 
-    if (!category.trim() || !question.trim() || !Array.isArray(options) || options.length < 2 || !answer.trim()) {
+    if (
+      !category.trim() ||
+      !question.trim() ||
+      !Array.isArray(options) ||
+      options.length < 2 ||
+      !answer.trim()
+    ) {
       sendJson(response, 400, {
         message: "category, question, options(2+) and answer are required.",
       });
@@ -488,7 +648,9 @@ const handleQuestions = async (request, response, pathname) => {
     }
 
     if (Array.isArray(body.options)) {
-      updates.options = body.options.map((item) => String(item).trim()).filter(Boolean);
+      updates.options = body.options
+        .map((item) => String(item).trim())
+        .filter(Boolean);
     }
 
     if (typeof body.answer === "string") {
@@ -496,7 +658,9 @@ const handleQuestions = async (request, response, pathname) => {
     }
 
     if (typeof body.section === "string") {
-      updates.section = ["quiz", "contest", "both"].includes(body.section) ? body.section : "both";
+      updates.section = ["quiz", "contest", "both"].includes(body.section)
+        ? body.section
+        : "both";
     }
 
     if (!Object.keys(updates).length) {
@@ -504,14 +668,21 @@ const handleQuestions = async (request, response, pathname) => {
       return true;
     }
 
-    const updatedQuestion = await Question.findByIdAndUpdate(questionId, updates, { new: true });
+    const updatedQuestion = await Question.findByIdAndUpdate(
+      questionId,
+      updates,
+      { new: true },
+    );
 
     if (!updatedQuestion) {
       sendJson(response, 404, { message: "Question not found." });
       return true;
     }
 
-    sendJson(response, 200, { message: "Question updated.", question: normalizeQuestion(updatedQuestion) });
+    sendJson(response, 200, {
+      message: "Question updated.",
+      question: normalizeQuestion(updatedQuestion),
+    });
     return true;
   }
 
@@ -556,16 +727,23 @@ const handleContestSettings = async (request, response, pathname) => {
     const updates = {};
 
     if ("contestName" in body) {
-      const name = typeof body.contestName === "string" ? body.contestName.trim() : "";
+      const name =
+        typeof body.contestName === "string" ? body.contestName.trim() : "";
       updates.contestName = name || "Weekly Contest";
     }
 
     if (typeof body.contestQuestionCount === "number") {
-      updates.contestQuestionCount = Math.max(1, Math.min(100, Math.floor(body.contestQuestionCount)));
+      updates.contestQuestionCount = Math.max(
+        1,
+        Math.min(100, Math.floor(body.contestQuestionCount)),
+      );
     }
 
     if (typeof body.contestDurationSeconds === "number") {
-      updates.contestDurationSeconds = Math.max(30, Math.min(14400, Math.floor(body.contestDurationSeconds)));
+      updates.contestDurationSeconds = Math.max(
+        30,
+        Math.min(14400, Math.floor(body.contestDurationSeconds)),
+      );
     }
 
     if (typeof body.isScheduled === "boolean") {
@@ -594,7 +772,10 @@ const handleContestSettings = async (request, response, pathname) => {
     Object.assign(settingsDoc, updates);
     await settingsDoc.save();
 
-    sendJson(response, 200, { message: "Contest settings updated.", settings: normalizeContestSettings(settingsDoc) });
+    sendJson(response, 200, {
+      message: "Contest settings updated.",
+      settings: normalizeContestSettings(settingsDoc),
+    });
     return true;
   }
 
@@ -623,13 +804,17 @@ export const handleApiRequest = async (request, response) => {
     sendJson(response, 200, {
       status: "ok",
       dbReadyState: mongoose.connection.readyState,
-      mailReady: smtpReady,
-      ...(smtpLastError ? { mailError: smtpLastError } : {}),
+      mailReady,
+      ...(mailLastError ? { mailError: mailLastError } : {}),
     });
     return true;
   }
 
   try {
+    if (await handleCompile(request, response, pathname)) {
+      return true;
+    }
+
     await connectDb();
 
     if (await handleUsers(request, response, pathname)) {
@@ -655,12 +840,16 @@ export const handleApiRequest = async (request, response) => {
     const isInvalidObjectId = error instanceof mongoose.Error.CastError;
     const isConfigError =
       /MONGODB_URI is missing/i.test(error?.message || "") ||
-      /URI|connection string|SRV|MongoParseError|Invalid scheme/i.test(error?.message || "");
+      /URI|connection string|SRV|MongoParseError|Invalid scheme/i.test(
+        error?.message || "",
+      );
     const isDbConnectionError =
       /Server selection timed out|ENOTFOUND|ECONNREFUSED|ECONNRESET|timed out|querySrv|SSL|authentication failed|bad auth/i.test(
         error?.message || "",
       );
-    const isResendError = /Resend API error|Resend is not configured/i.test(error?.message || "");
+    const isResendError = /Resend API error|Resend is not configured/i.test(
+      error?.message || "",
+    );
     const statusCode = isDuplicateEmail ? 409 : isInvalidObjectId ? 400 : 500;
     const message = isDuplicateEmail
       ? "This email is already registered."
@@ -670,9 +859,9 @@ export const handleApiRequest = async (request, response) => {
           ? `Database configuration error: ${error.message}`
           : isDbConnectionError
             ? `Database connection failed: ${error.message}. Check MONGODB_URI, MongoDB Atlas Network Access (IP allowlist), and database user credentials.`
-          : isResendError
-            ? `Email delivery failed: ${error.message}`
-          : "Database error.";
+            : isResendError
+              ? `Email delivery failed: ${error.message}`
+              : "Database error.";
 
     sendJson(response, statusCode, { message });
     return true;
