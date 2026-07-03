@@ -9,6 +9,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "compile-run": "^2.3.4",
     "dotenv": "^17.4.2",
     "mongoose": "^8.24.0",
     "resend": "^6.12.4"
