@@ -1,8 +1,12 @@
 /* eslint-env node */
 import mongoose from "mongoose";
 import crypto from "node:crypto";
-import nodemailer from "nodemailer";
 import { Resend } from "resend";
+import {
+  isSupportedCompilerLanguage,
+  runCompiledCode,
+  verifyCompilerSetup,
+} from "./compiler.js";
 import { ContestSettings, Question, User, connectDb } from "./db.js";
 
 const sendJson = (response, statusCode, payload) => {
@@ -41,23 +45,9 @@ const readRequestJson = async (request) =>
 
 const RESET_OTP_EXPIRY_MS = 10 * 60 * 1000;
 const passwordResetOtps = new Map();
-let smtpReady = false;
-let smtpLastError = "";
-const mailProvider = (process.env.MAIL_PROVIDER || "resend").trim().toLowerCase();
-let smtpTransporter = null;
 let mailReady = false;
 let mailLastError = "";
 let resendClient = null;
-const PISTON_API_URL = (
-  process.env.PISTON_API_URL || "https://emkc.org/api/v2/piston"
-).replace(/\/+$/, "");
-const compilerRuntimeAliases = {
-  cpp: ["c++", "cpp"],
-  java: ["java"],
-  python: ["python", "python3"],
-};
-let compilerRuntimesCache = null;
-let compilerRuntimesLoadedAt = 0;
 
 const makeOtp = () => String(Math.floor(100000 + Math.random() * 900000));
 
@@ -121,12 +111,6 @@ const sendWithResend = async ({ email, subject, html, text }) => {
     html,
     text,
   });
-};
-
-const isResendConfigured = () => {
-  const apiKey = (process.env.RESEND_API_KEY || "").trim();
-  const from = (process.env.RESEND_FROM || process.env.SMTP_FROM || "").trim();
-  return Boolean(apiKey && from);
 
   if (error) {
     throw new Error(`Resend API error: ${error.message}`);
@@ -135,28 +119,6 @@ const isResendConfigured = () => {
 
 export const verifyResendConnection = async () => {
   try {
-    if (mailProvider === "smtp") {
-      await createSmtpTransporter().verify();
-      smtpReady = true;
-      smtpLastError = "";
-      return true;
-    }
-
-    if (mailProvider === "resend") {
-      const apiKey = (process.env.RESEND_API_KEY || "").trim();
-      const from = (process.env.RESEND_FROM || process.env.SMTP_FROM || "").trim();
-      if (!apiKey || !from) {
-        throw new Error("Resend is not configured. Add RESEND_API_KEY and RESEND_FROM in backend/.env.");
-      }
-      smtpReady = true;
-      smtpLastError = "";
-      return true;
-    }
-
-    throw new Error("Unsupported MAIL_PROVIDER. Set MAIL_PROVIDER=smtp or MAIL_PROVIDER=resend.");
-  } catch (error) {
-    smtpReady = false;
-    smtpLastError = error?.message || "Mail verification failed.";
     getResendClient();
 
     const from = (process.env.RESEND_FROM || "").trim();
@@ -180,51 +142,16 @@ const sendOtpEmail = async ({ email, otp, subject, title }) => {
   const text = `Your OTP is ${otp}. It is valid for 10 minutes.`;
   const html = `<p>${title}</p><p>Your OTP is <strong>${otp}</strong>.</p><p>It is valid for 10 minutes.</p>`;
 
-  if (mailProvider === "smtp") {
-    await sendWithSmtp({ email, subject, html, text });
-    return;
-  }
-
   await sendWithResend({ email, subject, html, text });
 };
 
 const sendResetOtpEmail = async (email, otp) =>
   sendOtpEmail({
-     from: "Quiz App <noreply@yourdomain.com>",
     email,
     otp,
-    subject: "Online Quiz password reset OTP",
+    subject: "Code Snipers password reset OTP",
     title: "Use this OTP to reset your password.",
   });
-
-const getCompilerRuntimes = async () => {
-  const cacheAgeMs = Date.now() - compilerRuntimesLoadedAt;
-
-  if (compilerRuntimesCache && cacheAgeMs < 30 * 60 * 1000) {
-    return compilerRuntimesCache;
-  }
-
-  const response = await fetch(`${PISTON_API_URL}/runtimes`);
-
-  if (!response.ok) {
-    throw new Error("Compiler service runtimes could not be loaded.");
-  }
-
-  compilerRuntimesCache = await response.json();
-  compilerRuntimesLoadedAt = Date.now();
-  return compilerRuntimesCache;
-};
-
-const resolveCompilerRuntime = async (language) => {
-  const aliases = compilerRuntimeAliases[language] || [];
-  const runtimes = await getCompilerRuntimes();
-
-  return runtimes.find((runtime) =>
-    aliases.some(
-      (alias) => runtime.language === alias || runtime.aliases?.includes(alias),
-    ),
-  );
-};
 
 const handleCompile = async (request, response, pathname) => {
   if (pathname !== "/api/compile") {
@@ -243,7 +170,7 @@ const handleCompile = async (request, response, pathname) => {
   const code = String(body.code || "");
   const stdin = String(body.stdin || "");
 
-  if (!compilerRuntimeAliases[language]) {
+  if (!isSupportedCompilerLanguage(language)) {
     sendJson(response, 400, {
       message: "Supported server languages: python, java, cpp.",
     });
@@ -260,52 +187,15 @@ const handleCompile = async (request, response, pathname) => {
     return true;
   }
 
-  const runtime = await resolveCompilerRuntime(language);
-
-  if (!runtime) {
-    sendJson(response, 503, {
-      message: `${language} runtime is not available right now.`,
+  try {
+    const result = await runCompiledCode({ language, code, stdin });
+    sendJson(response, 200, result);
+  } catch (error) {
+    sendJson(response, error.statusCode || 500, {
+      message: error.message || "Compiler service could not run this code.",
     });
-    return true;
   }
 
-  const compileResponse = await fetch(`${PISTON_API_URL}/execute`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      language: runtime.language,
-      version: runtime.version,
-      files: [{ content: code }],
-      stdin,
-    }),
-  });
-
-  const payload = await compileResponse.json().catch(() => ({}));
-
-  if (!compileResponse.ok) {
-    sendJson(response, compileResponse.status, {
-      message: payload.message || "Compiler service could not run this code.",
-    });
-    return true;
-  }
-
-  const runOutput = payload.run || {};
-  const compileOutput = payload.compile || {};
-  const output = [
-    compileOutput.stdout,
-    compileOutput.stderr,
-    runOutput.stdout,
-    runOutput.stderr,
-  ]
-    .filter(Boolean)
-    .join("");
-
-  sendJson(response, 200, {
-    output: output || "Code ran successfully with no output.",
-    code: runOutput.code ?? compileOutput.code ?? 0,
-    signal: runOutput.signal || compileOutput.signal || null,
-    runtime: `${runtime.language} ${runtime.version}`,
-  });
   return true;
 };
 
