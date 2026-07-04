@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import { handleApiRequest, verifyResendConnection } from "./server/apiHandler.js";
+import { verifyCompilerSetup } from "./server/compiler.js";
 import { connectDb } from "./server/db.js";
 import { handlePageRequest } from "./server/pageHandler.js";
 
@@ -49,5 +50,15 @@ server.listen(port, () => {
     })
     .catch((error) => {
       console.error("Resend mail configuration error:", error.message);
+    });
+
+  verifyCompilerSetup()
+    .then((setup) => {
+      console.log(
+        `Code compiler ready (${setup.provider}${setup.url ? `: ${setup.url}` : ""}).`,
+      );
+    })
+    .catch((error) => {
+      console.error("Code compiler setup error:", error.message);
     });
 });
