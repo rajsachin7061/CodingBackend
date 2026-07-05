@@ -191,9 +191,19 @@ const handleCompile = async (request, response, pathname) => {
     const result = await runCompiledCode({ language, code, stdin });
     sendJson(response, 200, result);
   } catch (error) {
-    sendJson(response, error.statusCode || 500, {
+    const payload = {
       message: error.message || "Compiler service could not run this code.",
-    });
+    };
+
+    if (error.code) {
+      payload.code = error.code;
+    }
+
+    if (error.tool) {
+      payload.tool = error.tool;
+    }
+
+    sendJson(response, error.statusCode || 500, payload);
   }
 
   return true;
