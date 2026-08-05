@@ -4,7 +4,13 @@ import mongoose from "mongoose";
 const userSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
-    email: { type: String, required: true, trim: true, lowercase: true, unique: true },
+    email: {
+      type: String,
+      required: true,
+      trim: true,
+      lowercase: true,
+      unique: true,
+    },
     username: { type: String, trim: true, default: "" },
     password: { type: String, required: true },
     photo: { type: String, default: "" },
@@ -21,7 +27,11 @@ const questionSchema = new mongoose.Schema(
     question: { type: String, required: true, trim: true },
     options: { type: [String], required: true },
     answer: { type: String, required: true, trim: true },
-    section: { type: String, enum: ["quiz", "contest", "both"], default: "both" },
+    section: {
+      type: String,
+      enum: ["quiz", "contest", "both"],
+      default: "both",
+    },
   },
   { timestamps: true },
 );
@@ -41,10 +51,98 @@ const contestSettingsSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
+const testCaseSchema = new mongoose.Schema(
+  {
+    input: { type: String, default: "" },
+    output: { type: String, default: "" },
+    explanation: { type: String, default: "" },
+  },
+  { _id: false },
+);
+
+const starterCodeSchema = new mongoose.Schema(
+  {
+    java: { type: String, default: "" },
+    cpp: { type: String, default: "" },
+    python: { type: String, default: "" },
+    javascript: { type: String, default: "" },
+  },
+  { _id: false },
+);
+
+const problemSchema = new mongoose.Schema(
+  {
+    title: { type: String, required: true, trim: true },
+    slug: {
+      type: String,
+      required: true,
+      trim: true,
+      lowercase: true,
+      unique: true,
+    },
+    difficulty: {
+      type: String,
+      enum: ["Easy", "Medium", "Hard"],
+      required: true,
+    },
+    programmingLanguage: { type: String, required: true, trim: true },
+    description: { type: String, required: true, trim: true },
+    notes: { type: String, default: "" },
+    inputFormat: { type: String, default: "" },
+    outputFormat: { type: String, default: "" },
+    constraints: { type: String, default: "" },
+    sampleTestCases: { type: [testCaseSchema], default: [] },
+    hiddenTestCases: { type: [testCaseSchema], default: [] },
+    starterCode: { type: starterCodeSchema, default: () => ({}) },
+    tags: { type: [String], default: [] },
+    timeLimit: { type: String, default: "1 second" },
+    memoryLimit: { type: String, default: "256 MB" },
+    explanation: { type: String, default: "" },
+  },
+  { timestamps: true },
+);
+
+problemSchema.index(
+  { title: "text", slug: "text", tags: "text" },
+  { default_language: "none", language_override: "mongoTextLanguage" },
+);
+problemSchema.index({ difficulty: 1, programmingLanguage: 1, createdAt: -1 });
+
+const submissionSchema = new mongoose.Schema(
+  {
+    problemId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Problem",
+      required: true,
+    },
+    problemSlug: { type: String, trim: true, default: "" },
+    userEmail: { type: String, trim: true, lowercase: true, default: "" },
+    username: { type: String, trim: true, default: "" },
+    language: { type: String, required: true, trim: true },
+    code: { type: String, default: "" },
+    status: {
+      type: String,
+      enum: ["Accepted", "Failed"],
+      default: "Accepted",
+    },
+    passedCount: { type: Number, default: 0, min: 0 },
+    totalCount: { type: Number, default: 0, min: 0 },
+  },
+  { timestamps: true },
+);
+
+submissionSchema.index({ problemId: 1, userEmail: 1, createdAt: -1 });
+
 export const User = mongoose.models.User || mongoose.model("User", userSchema);
-export const Question = mongoose.models.Question || mongoose.model("Question", questionSchema);
+export const Question =
+  mongoose.models.Question || mongoose.model("Question", questionSchema);
+export const Problem =
+  mongoose.models.Problem || mongoose.model("Problem", problemSchema);
 export const ContestSettings =
-  mongoose.models.ContestSettings || mongoose.model("ContestSettings", contestSettingsSchema);
+  mongoose.models.ContestSettings ||
+  mongoose.model("ContestSettings", contestSettingsSchema);
+export const Submission =
+  mongoose.models.Submission || mongoose.model("Submission", submissionSchema);
 
 let connectionPromise;
 
@@ -69,6 +167,7 @@ export const connectDb = async () => {
         await Promise.all([
           User.createCollection().catch(() => undefined),
           Question.createCollection().catch(() => undefined),
+          Problem.createCollection().catch(() => undefined),
           ContestSettings.createCollection().catch(() => undefined),
         ]);
       })

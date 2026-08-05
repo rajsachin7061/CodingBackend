@@ -7,13 +7,20 @@ import {
   runCompiledCode,
   verifyCompilerSetup,
 } from "./compiler.js";
-import { ContestSettings, Question, User, connectDb } from "./db.js";
+import {
+  ContestSettings,
+  Problem,
+  Question,
+  Submission,
+  User,
+  connectDb,
+} from "./db.js";
 
 const sendJson = (response, statusCode, payload) => {
   response.writeHead(statusCode, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*",
-    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type,Authorization",
   });
   response.end(JSON.stringify(payload));
@@ -234,6 +241,36 @@ const normalizeQuestion = (doc) => ({
   updatedAt: doc.updatedAt,
 });
 
+const normalizeProblem = (doc) => {
+  const problem = typeof doc.toObject === "function" ? doc.toObject() : doc;
+
+  return {
+    id: problem._id.toString(),
+    title: problem.title,
+    slug: problem.slug,
+    difficulty: problem.difficulty,
+    programmingLanguage: problem.programmingLanguage || problem.language || "",
+    description: problem.description,
+    notes: problem.notes || "",
+    inputFormat: problem.inputFormat || "",
+    outputFormat: problem.outputFormat || "",
+    constraints: problem.constraints || "",
+    sampleTestCases: Array.isArray(problem.sampleTestCases)
+      ? problem.sampleTestCases
+      : [],
+    hiddenTestCases: Array.isArray(problem.hiddenTestCases)
+      ? problem.hiddenTestCases
+      : [],
+    starterCode: problem.starterCode || {},
+    tags: Array.isArray(problem.tags) ? problem.tags : [],
+    timeLimit: problem.timeLimit || "",
+    memoryLimit: problem.memoryLimit || "",
+    explanation: problem.explanation || "",
+    createdAt: problem.createdAt,
+    updatedAt: problem.updatedAt,
+  };
+};
+
 const normalizeContestSettings = (doc) => ({
   contestName: doc?.contestName?.trim() || "Weekly Contest",
   contestQuestionCount: doc?.contestQuestionCount ?? 10,
@@ -249,11 +286,364 @@ const normalizeContestSettings = (doc) => ({
   showLeaderboardToUsers: Boolean(doc?.showLeaderboardToUsers),
 });
 
+const handleVerifySolution = async (request, response, pathname) => {
+  const match = pathname.match(/^\/api\/problems\/([^/]+)\/verify-solution$/);
+
+  if (!match || request.method !== "POST") {
+    return false;
+  }
+
+  const problemIdOrSlug = decodeURIComponent(match[1]);
+  const body = await readRequestJson(request);
+  const language = getCompilerLanguageKey(
+    body.language || body.programmingLanguage || "",
+  );
+  const code = String(body.code || "");
+
+  if (!isSupportedCompilerLanguage(language)) {
+    sendJson(response, 400, {
+      message: "Supported server languages: python, java, cpp.",
+    });
+    return true;
+  }
+
+  if (!code.trim()) {
+    sendJson(response, 400, { message: "Please enter code to run." });
+    return true;
+  }
+
+  const problem = await findProblemByIdOrSlug(problemIdOrSlug);
+
+  if (!problem) {
+    sendJson(response, 404, { message: "Problem not found." });
+    return true;
+  }
+
+  const hiddenTestCases = Array.isArray(problem.hiddenTestCases)
+    ? problem.hiddenTestCases
+    : [];
+
+  if (!hiddenTestCases.length) {
+    sendJson(response, 200, {
+      message: "No hidden verification tests are configured for this problem.",
+      allPassed: false,
+      passedCount: 0,
+      totalCount: 0,
+    });
+    return true;
+  }
+
+  let passedCount = 0;
+  let failed = false;
+
+  for (const testCase of hiddenTestCases) {
+    try {
+      const result = await runCompiledCode({
+        language,
+        code,
+        stdin: String(testCase.input || ""),
+      });
+      const actualOutput = normalizeVerificationOutput(result.output);
+      const expectedOutput = normalizeVerificationOutput(testCase.output);
+
+      if (actualOutput === expectedOutput) {
+        passedCount += 1;
+      } else {
+        failed = true;
+        break;
+      }
+    } catch {
+      failed = true;
+      break;
+    }
+  }
+
+  sendJson(response, 200, {
+    allPassed: !failed && passedCount === hiddenTestCases.length,
+    passedCount,
+    totalCount: hiddenTestCases.length,
+  });
+  return true;
+};
+
 const getIdFromPath = (pathname, resource) => {
   const match = pathname.match(
     new RegExp(`^/api/${resource}/([a-fA-F0-9]{24})$`),
   );
   return match ? match[1] : null;
+};
+
+const slugify = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 90);
+
+const cleanTextArray = (items) =>
+  Array.isArray(items)
+    ? items.map((item) => String(item).trim()).filter(Boolean)
+    : String(items || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+
+const cleanTestCases = (items) =>
+  Array.isArray(items)
+    ? items
+        .map((item) => ({
+          input: String(item?.input || ""),
+          output: String(item?.output || ""),
+          explanation: String(item?.explanation || ""),
+        }))
+        .filter(
+          (item) =>
+            item.input.trim() || item.output.trim() || item.explanation.trim(),
+        )
+    : [];
+
+const cleanStarterCode = (starterCode = {}) => ({
+  java: String(starterCode.java || ""),
+  cpp: String(starterCode.cpp || ""),
+  python: String(starterCode.python || ""),
+  javascript: String(starterCode.javascript || ""),
+});
+
+const normalizeVerificationOutput = (value) =>
+  String(value ?? "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+
+const normalizeSubmission = (doc) => ({
+  id: doc._id.toString(),
+  problemId: doc.problemId?.toString() || "",
+  problemSlug: doc.problemSlug || "",
+  userEmail: doc.userEmail || "",
+  username: doc.username || "",
+  language: doc.language || "",
+  status: doc.status || "",
+  passedCount: doc.passedCount || 0,
+  totalCount: doc.totalCount || 0,
+  createdAt: doc.createdAt,
+  updatedAt: doc.updatedAt,
+});
+
+const handleSubmitSolution = async (request, response, pathname) => {
+  const match = pathname.match(/^\/api\/problems\/([^/]+)\/submit-solution$/);
+
+  if (!match || request.method !== "POST") {
+    return false;
+  }
+
+  const problemIdOrSlug = decodeURIComponent(match[1]);
+  const body = await readRequestJson(request);
+  const language = getCompilerLanguageKey(
+    body.language || body.programmingLanguage || "",
+  );
+  const code = String(body.code || "");
+  const userEmail =
+    typeof body.userEmail === "string"
+      ? body.userEmail.trim().toLowerCase()
+      : "";
+  const username =
+    typeof body.username === "string" ? body.username.trim() : "";
+
+  if (!isSupportedCompilerLanguage(language)) {
+    sendJson(response, 400, {
+      message: "Supported server languages: python, java, cpp.",
+    });
+    return true;
+  }
+
+  if (!code.trim()) {
+    sendJson(response, 400, { message: "Please enter code to submit." });
+    return true;
+  }
+
+  const problem = await findProblemByIdOrSlug(problemIdOrSlug);
+
+  if (!problem) {
+    sendJson(response, 404, { message: "Problem not found." });
+    return true;
+  }
+
+  const hiddenTestCases = Array.isArray(problem.hiddenTestCases)
+    ? problem.hiddenTestCases
+    : [];
+
+  if (!hiddenTestCases.length) {
+    sendJson(response, 400, {
+      message: "No hidden verification tests are configured for this problem.",
+    });
+    return true;
+  }
+
+  let passedCount = 0;
+  let failed = false;
+
+  for (const testCase of hiddenTestCases) {
+    try {
+      const result = await runCompiledCode({
+        language,
+        code,
+        stdin: String(testCase.input || ""),
+      });
+      const actualOutput = normalizeVerificationOutput(result.output);
+      const expectedOutput = normalizeVerificationOutput(testCase.output);
+
+      if (actualOutput === expectedOutput) {
+        passedCount += 1;
+      } else {
+        failed = true;
+        break;
+      }
+    } catch {
+      failed = true;
+      break;
+    }
+  }
+
+  if (!passedCount || failed || passedCount !== hiddenTestCases.length) {
+    sendJson(response, 400, {
+      message: "Solution did not pass all verification tests.",
+      passedCount,
+      totalCount: hiddenTestCases.length,
+    });
+    return true;
+  }
+
+  const submission = await Submission.create({
+    problemId: problem._id,
+    problemSlug: problem.slug,
+    userEmail,
+    username,
+    language,
+    code,
+    status: "Accepted",
+    passedCount,
+    totalCount: hiddenTestCases.length,
+  });
+
+  sendJson(response, 201, {
+    message: "Solution submitted and accepted.",
+    submission: normalizeSubmission(submission),
+  });
+  return true;
+};
+
+const getCompilerLanguageKey = (value) => {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  if (["java", "javac", "jvm"].includes(normalized)) {
+    return "java";
+  }
+
+  if (["c++", "cpp", "c/c++", "c"].includes(normalized)) {
+    return "cpp";
+  }
+
+  if (["python", "py"].includes(normalized)) {
+    return "python";
+  }
+
+  return normalized;
+};
+
+const buildProblemPayload = (body, { partial = false } = {}) => {
+  const payload = {};
+
+  if (!partial || "title" in body) {
+    payload.title = String(body.title || "").trim();
+  }
+
+  if (!partial || "slug" in body || "title" in body) {
+    payload.slug = slugify(body.slug || body.title);
+  }
+
+  if (!partial || "difficulty" in body) {
+    payload.difficulty = String(body.difficulty || "").trim();
+  }
+
+  if (!partial || "programmingLanguage" in body || "language" in body) {
+    payload.programmingLanguage = String(
+      body.programmingLanguage || body.language || "",
+    ).trim();
+  }
+
+  if (!partial || "description" in body) {
+    payload.description = String(body.description || "").trim();
+  }
+
+  [
+    "notes",
+    "inputFormat",
+    "outputFormat",
+    "constraints",
+    "timeLimit",
+    "memoryLimit",
+    "explanation",
+  ].forEach((field) => {
+    if (!partial || field in body) {
+      payload[field] = String(body[field] || "").trim();
+    }
+  });
+
+  if (!partial || "sampleTestCases" in body) {
+    payload.sampleTestCases = cleanTestCases(body.sampleTestCases);
+  }
+
+  if (!partial || "hiddenTestCases" in body) {
+    payload.hiddenTestCases = cleanTestCases(body.hiddenTestCases);
+  }
+
+  if (!partial || "starterCode" in body) {
+    payload.starterCode = cleanStarterCode(body.starterCode || {});
+  }
+
+  if (!partial || "tags" in body) {
+    payload.tags = cleanTextArray(body.tags);
+  }
+
+  Object.keys(payload).forEach((key) => {
+    if (partial && payload[key] === undefined) {
+      delete payload[key];
+    }
+  });
+
+  return payload;
+};
+
+const validateProblemPayload = (payload, { partial = false } = {}) => {
+  const requiredFields = [
+    "title",
+    "slug",
+    "difficulty",
+    "programmingLanguage",
+    "description",
+  ];
+  const missingField = requiredFields.find(
+    (field) => !partial && !String(payload[field] || "").trim(),
+  );
+
+  if (missingField) {
+    return `${missingField} is required.`;
+  }
+
+  if (
+    "difficulty" in payload &&
+    !["Easy", "Medium", "Hard"].includes(payload.difficulty)
+  ) {
+    return "difficulty must be Easy, Medium, or Hard.";
+  }
+
+  if ("slug" in payload && !payload.slug) {
+    return "slug is required.";
+  }
+
+  return "";
 };
 
 const handleUsers = async (request, response, pathname) => {
@@ -601,6 +991,192 @@ const handleQuestions = async (request, response, pathname) => {
   return false;
 };
 
+const getProblemIdFromPath = (pathname) => {
+  const match = pathname.match(/^\/api\/problems\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
+};
+
+const findProblemByIdOrSlug = (idOrSlug) => {
+  if (mongoose.Types.ObjectId.isValid(idOrSlug)) {
+    return Problem.findById(idOrSlug).lean();
+  }
+
+  return Problem.findOne({
+    slug: String(idOrSlug || "")
+      .trim()
+      .toLowerCase(),
+  }).lean();
+};
+
+const findExistingProblemSlug = async (slug, excludedId = "") => {
+  if (!slug) {
+    return null;
+  }
+
+  const query = { slug };
+
+  if (excludedId && mongoose.Types.ObjectId.isValid(excludedId)) {
+    query._id = { $ne: excludedId };
+  }
+
+  return Problem.findOne(query).select("_id");
+};
+
+const handleProblems = async (request, response, pathname, url) => {
+  if (request.method === "GET" && pathname === "/api/problems") {
+    const page = Math.max(
+      1,
+      Number.parseInt(url.searchParams.get("page") || "1", 10),
+    );
+    const limit = Math.min(
+      100,
+      Math.max(1, Number.parseInt(url.searchParams.get("limit") || "20", 10)),
+    );
+    const search = (url.searchParams.get("search") || "").trim();
+    const difficulty = (url.searchParams.get("difficulty") || "").trim();
+    const programmingLanguage = (
+      url.searchParams.get("programmingLanguage") ||
+      url.searchParams.get("language") ||
+      ""
+    ).trim();
+    const query = {};
+
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: "i" } },
+        { slug: { $regex: search, $options: "i" } },
+        { tags: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    if (difficulty) {
+      query.difficulty = difficulty;
+    }
+
+    if (programmingLanguage) {
+      query.$and = [
+        ...(query.$and || []),
+        {
+          $or: [
+            {
+              programmingLanguage: {
+                $regex: `^${programmingLanguage}$`,
+                $options: "i",
+              },
+            },
+            { language: { $regex: `^${programmingLanguage}$`, $options: "i" } },
+          ],
+        },
+      ];
+    }
+
+    const [rows, total] = await Promise.all([
+      Problem.find(query)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Problem.countDocuments(query),
+    ]);
+
+    sendJson(response, 200, {
+      items: rows.map(normalizeProblem),
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+    return true;
+  }
+
+  const problemId = getProblemIdFromPath(pathname);
+
+  if (request.method === "GET" && problemId) {
+    const problem = await findProblemByIdOrSlug(problemId);
+
+    if (!problem) {
+      sendJson(response, 404, { message: "Problem not found." });
+      return true;
+    }
+
+    sendJson(response, 200, normalizeProblem(problem));
+    return true;
+  }
+
+  if (request.method === "POST" && pathname === "/api/problems") {
+    const body = await readRequestJson(request);
+    const payload = buildProblemPayload(body);
+    const validationError = validateProblemPayload(payload);
+
+    if (validationError) {
+      sendJson(response, 400, { message: validationError });
+      return true;
+    }
+
+    if (await findExistingProblemSlug(payload.slug)) {
+      sendJson(response, 409, {
+        message: "This problem slug is already used.",
+      });
+      return true;
+    }
+
+    const problem = await Problem.create(payload);
+    sendJson(response, 201, {
+      message: "Problem created.",
+      problem: normalizeProblem(problem),
+    });
+    return true;
+  }
+
+  if (request.method === "PUT" && problemId) {
+    const body = await readRequestJson(request);
+    const payload = buildProblemPayload(body);
+    const validationError = validateProblemPayload(payload);
+
+    if (validationError) {
+      sendJson(response, 400, { message: validationError });
+      return true;
+    }
+
+    if (await findExistingProblemSlug(payload.slug, problemId)) {
+      sendJson(response, 409, {
+        message: "This problem slug is already used.",
+      });
+      return true;
+    }
+
+    const updatedProblem = await Problem.findByIdAndUpdate(problemId, payload, {
+      new: true,
+      runValidators: true,
+    });
+
+    if (!updatedProblem) {
+      sendJson(response, 404, { message: "Problem not found." });
+      return true;
+    }
+
+    sendJson(response, 200, {
+      message: "Problem updated.",
+      problem: normalizeProblem(updatedProblem),
+    });
+    return true;
+  }
+
+  if (request.method === "DELETE" && problemId) {
+    const deletedProblem = await Problem.findByIdAndDelete(problemId);
+
+    if (!deletedProblem) {
+      sendJson(response, 404, { message: "Problem not found." });
+      return true;
+    }
+
+    sendJson(response, 200, { message: "Problem deleted." });
+    return true;
+  }
+
+  return false;
+};
+
 const getContestSettingsDoc = async () => {
   const existing = await ContestSettings.findOne({ key: "default" });
 
@@ -693,7 +1269,7 @@ export const handleApiRequest = async (request, response) => {
   if (request.method === "OPTIONS") {
     response.writeHead(204, {
       "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*",
-      "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+      "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type,Authorization",
     });
     response.end();
@@ -717,6 +1293,14 @@ export const handleApiRequest = async (request, response) => {
 
     await connectDb();
 
+    if (await handleVerifySolution(request, response, pathname)) {
+      return true;
+    }
+
+    if (await handleSubmitSolution(request, response, pathname)) {
+      return true;
+    }
+
     if (await handleUsers(request, response, pathname)) {
       return true;
     }
@@ -729,6 +1313,10 @@ export const handleApiRequest = async (request, response) => {
       return true;
     }
 
+    if (await handleProblems(request, response, pathname, url)) {
+      return true;
+    }
+
     if (await handleContestSettings(request, response, pathname)) {
       return true;
     }
@@ -736,32 +1324,61 @@ export const handleApiRequest = async (request, response) => {
     sendJson(response, 404, { message: "API route not found." });
     return true;
   } catch (error) {
-    const isDuplicateEmail = error?.code === 11000;
+    const duplicateField = error?.keyPattern
+      ? Object.keys(error.keyPattern)[0]
+      : "";
+    const isDuplicateRecord = error?.code === 11000;
     const isInvalidObjectId = error instanceof mongoose.Error.CastError;
+    const isValidationError = error instanceof mongoose.Error.ValidationError;
     const isConfigError =
       /MONGODB_URI is missing/i.test(error?.message || "") ||
       /URI|connection string|SRV|MongoParseError|Invalid scheme/i.test(
         error?.message || "",
       );
     const isDbConnectionError =
-      /Server selection timed out|ENOTFOUND|ECONNREFUSED|ECONNRESET|timed out|querySrv|SSL|authentication failed|bad auth/i.test(
+      error?.name === "MongooseServerSelectionError" ||
+      /Server selection timed out|Could not connect to any servers|ENOTFOUND|ECONNREFUSED|ECONNRESET|timed out|querySrv|SSL|authentication failed|bad auth|IP whitelist|IP allowlist/i.test(
         error?.message || "",
       );
     const isResendError = /Resend API error|Resend is not configured/i.test(
       error?.message || "",
     );
-    const statusCode = isDuplicateEmail ? 409 : isInvalidObjectId ? 400 : 500;
-    const message = isDuplicateEmail
-      ? "This email is already registered."
+    if (
+      !isDuplicateRecord &&
+      !isInvalidObjectId &&
+      !isValidationError &&
+      !isConfigError &&
+      !isDbConnectionError &&
+      !isResendError
+    ) {
+      console.error("API request failed:", error);
+    }
+
+    const statusCode = isDuplicateRecord
+      ? 409
+      : isInvalidObjectId || isValidationError
+        ? 400
+        : 500;
+    const message = isDuplicateRecord
+      ? duplicateField === "slug"
+        ? "This problem slug is already used."
+        : duplicateField === "email"
+          ? "This email is already registered."
+          : "A record with this value already exists."
       : isInvalidObjectId
         ? "Invalid record id."
-        : isConfigError
-          ? `Database configuration error: ${error.message}`
-          : isDbConnectionError
-            ? `Database connection failed: ${error.message}. Check MONGODB_URI, MongoDB Atlas Network Access (IP allowlist), and database user credentials.`
-            : isResendError
-              ? `Email delivery failed: ${error.message}`
-              : "Database error.";
+        : isValidationError
+          ? Object.values(error.errors || {})
+              .map((item) => item.message)
+              .filter(Boolean)
+              .join(" ") || error.message
+          : isConfigError
+            ? `Database configuration error: ${error.message}`
+            : isDbConnectionError
+              ? `Database connection failed: ${error.message}. Check MONGODB_URI, MongoDB Atlas Network Access (IP allowlist), and database user credentials.`
+              : isResendError
+                ? `Email delivery failed: ${error.message}`
+                : "Database error.";
 
     sendJson(response, statusCode, { message });
     return true;
