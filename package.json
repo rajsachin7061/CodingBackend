@@ -6,7 +6,8 @@
   "main": "server.js",
   "scripts": {
     "dev": "nodemon server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "migrate:problem-language": "node scripts/migrate-problem-programming-language.js"
   },
   "dependencies": {
     "compile-run": "^2.3.4",
