@@ -167,7 +167,7 @@ const formatLocalOutput = (result) => {
 
   return {
     output: output || "Code ran successfully with no output.",
-    code: result.exitCode ?? 0,
+    code: result.exitCode != null ? result.exitCode : 0,
     signal: result.signal || null,
     runtime: "local",
     errorType,
@@ -220,7 +220,9 @@ const resolvePistonRuntime = async (language) => {
 
   return runtimes.find((runtime) =>
     aliases.some(
-      (alias) => runtime.language === alias || runtime.aliases?.includes(alias),
+      (alias) =>
+        runtime.language === alias ||
+        (runtime.aliases && runtime.aliases.includes(alias)),
     ),
   );
 };
@@ -266,7 +268,12 @@ const runWithPiston = async ({ language, code, stdin }) => {
 
   return {
     output: output || "Code ran successfully with no output.",
-    code: runOutput.code ?? compileOutput.code ?? 0,
+    code:
+      runOutput.code != null
+        ? runOutput.code
+        : compileOutput.code != null
+          ? compileOutput.code
+          : 0,
     signal: runOutput.signal || compileOutput.signal || null,
     runtime: `${runtime.language} ${runtime.version}`,
   };
@@ -338,7 +345,8 @@ export const runCompiledCode = async ({ language, code, stdin }) => {
 
     return result;
   } catch (error) {
-    const message = error?.message || "Could not run code locally.";
+    const message =
+      error && error.message ? error.message : "Could not run code locally.";
 
     if (error?.statusCode) {
       throw error;

@@ -42,7 +42,8 @@ const readRequestJson = async (request) =>
 
       try {
         resolve(JSON.parse(rawBody));
-      } catch {
+      } catch (error) {
+        void error;
         reject(new Error("Invalid JSON body"));
       }
     });
@@ -57,6 +58,11 @@ let mailLastError = "";
 let resendClient = null;
 
 const makeOtp = () => String(Math.floor(100000 + Math.random() * 900000));
+
+const getErrorMessage = (error, fallback) =>
+  error && typeof error.message === "string" && error.message.trim()
+    ? error.message
+    : fallback;
 
 const createResetRecord = (email) => {
   const otp = makeOtp();
@@ -140,7 +146,7 @@ export const verifyResendConnection = async () => {
     return true;
   } catch (error) {
     mailReady = false;
-    mailLastError = error?.message || "Resend verification failed.";
+    mailLastError = getErrorMessage(error, "Resend verification failed.");
     throw error;
   }
 };
@@ -272,18 +278,23 @@ const normalizeProblem = (doc) => {
 };
 
 const normalizeContestSettings = (doc) => ({
-  contestName: doc?.contestName?.trim() || "Weekly Contest",
-  contestQuestionCount: doc?.contestQuestionCount ?? 10,
+  contestName: doc && doc.contestName ? String(doc.contestName).trim() : "Weekly Contest",
+  contestQuestionCount:
+    doc && doc.contestQuestionCount != null ? doc.contestQuestionCount : 10,
   contestDurationSeconds:
-    doc?.contestDurationSeconds ??
-    (doc?.contestQuestionCount ?? 10) * (doc?.contestSecondsPerQuestion ?? 20),
-  isScheduled: Boolean(doc?.isScheduled),
-  startAt: doc?.startAt || null,
-  endAt: doc?.endAt || null,
-  selectedQuestionIds: Array.isArray(doc?.selectedQuestionIds)
+    doc && doc.contestDurationSeconds != null
+      ? doc.contestDurationSeconds
+      : ((doc && doc.contestQuestionCount != null ? doc.contestQuestionCount : 10) *
+          (doc && doc.contestSecondsPerQuestion != null
+            ? doc.contestSecondsPerQuestion
+            : 20)),
+  isScheduled: Boolean(doc && doc.isScheduled),
+  startAt: (doc && doc.startAt) || null,
+  endAt: (doc && doc.endAt) || null,
+  selectedQuestionIds: doc && Array.isArray(doc.selectedQuestionIds)
     ? doc.selectedQuestionIds
     : [],
-  showLeaderboardToUsers: Boolean(doc?.showLeaderboardToUsers),
+  showLeaderboardToUsers: Boolean(doc && doc.showLeaderboardToUsers),
 });
 
 const handleVerifySolution = async (request, response, pathname) => {
@@ -726,7 +737,7 @@ const handleUsers = async (request, response, pathname) => {
         return;
       }
 
-      updates[field] = value ?? null;
+      updates[field] = value == null ? null : value;
     });
 
     if (!Object.keys(updates).length) {
@@ -1331,9 +1342,9 @@ export const handleApiRequest = async (request, response) => {
     const isInvalidObjectId = error instanceof mongoose.Error.CastError;
     const isValidationError = error instanceof mongoose.Error.ValidationError;
     const isConfigError =
-      /MONGODB_URI is missing/i.test(error?.message || "") ||
+      /MONGODB_URI is missing/i.test(errorMessage) ||
       /URI|connection string|SRV|MongoParseError|Invalid scheme/i.test(
-        error?.message || "",
+        errorMessage,
       );
     const isDbConnectionError =
       error?.name === "MongooseServerSelectionError" ||
@@ -1341,7 +1352,7 @@ export const handleApiRequest = async (request, response) => {
         error?.message || "",
       );
     const isResendError = /Resend API error|Resend is not configured/i.test(
-      error?.message || "",
+      errorMessage,
     );
     if (
       !isDuplicateRecord &&
