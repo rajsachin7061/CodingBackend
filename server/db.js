@@ -85,8 +85,13 @@ const problemSchema = new mongoose.Schema(
       enum: ["Easy", "Medium", "Hard"],
       required: true,
     },
-    programmingLanguage: { type: String, required: true, trim: true },
-    description: { type: String, required: true, trim: true },
+    status: {
+      type: String,
+      enum: ["draft", "published"],
+      default: "published",
+    },
+    programmingLanguage: { type: String, default: "", trim: true },
+    description: { type: String, default: "", trim: true },
     notes: { type: String, default: "" },
     inputFormat: { type: String, default: "" },
     outputFormat: { type: String, default: "" },
@@ -94,6 +99,8 @@ const problemSchema = new mongoose.Schema(
     sampleTestCases: { type: [testCaseSchema], default: [] },
     hiddenTestCases: { type: [testCaseSchema], default: [] },
     starterCode: { type: starterCodeSchema, default: () => ({}) },
+    starterCodeTemplate: { type: String, default: "" },
+    solution: { type: String, default: "" },
     tags: { type: [String], default: [] },
     timeLimit: { type: String, default: "1 second" },
     memoryLimit: { type: String, default: "256 MB" },
@@ -106,7 +113,88 @@ problemSchema.index(
   { title: "text", slug: "text", tags: "text" },
   { default_language: "none", language_override: "mongoTextLanguage" },
 );
-problemSchema.index({ difficulty: 1, programmingLanguage: 1, createdAt: -1 });
+problemSchema.index({ difficulty: 1, status: 1, createdAt: -1 });
+
+const practiceQuestionDataSchema = new mongoose.Schema(problemSchema.obj, {
+  timestamps: true,
+});
+
+practiceQuestionDataSchema.index(
+  { title: "text", slug: "text", tags: "text" },
+  { default_language: "none", language_override: "mongoTextLanguage" },
+);
+practiceQuestionDataSchema.index({ difficulty: 1, status: 1, createdAt: -1 });
+
+const languageSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true, unique: true },
+    slug: {
+      type: String,
+      required: true,
+      trim: true,
+      lowercase: true,
+      unique: true,
+    },
+    icon: { type: String, default: "" },
+    order: { type: Number, default: 0 },
+  },
+  { timestamps: true },
+);
+
+const moduleSchema = new mongoose.Schema(
+  {
+    languageId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Language",
+      required: true,
+    },
+    title: { type: String, required: true, trim: true },
+    description: { type: String, default: "" },
+    order: { type: Number, default: 0 },
+  },
+  { timestamps: true },
+);
+
+moduleSchema.index({ languageId: 1, order: 1 });
+
+const practiceQuestionSchema = new mongoose.Schema(
+  {
+    moduleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Module",
+      required: true,
+    },
+    questionId: {
+      type: mongoose.Schema.Types.ObjectId,
+    },
+    questionType: {
+      type: String,
+      enum: ["global", "practice"],
+      default: "global",
+    },
+    problemId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Problem",
+    },
+    order: { type: Number, default: 0 },
+    status: {
+      type: String,
+      enum: ["active", "inactive"],
+      default: "active",
+    },
+  },
+  { timestamps: true },
+);
+
+practiceQuestionSchema.index({ moduleId: 1, order: 1 });
+practiceQuestionSchema.index(
+  { moduleId: 1, questionType: 1, questionId: 1 },
+  { unique: true, partialFilterExpression: { questionId: { $exists: true } } },
+);
+practiceQuestionSchema.index(
+  { moduleId: 1, problemId: 1 },
+  { unique: true, sparse: true },
+);
 
 const submissionSchema = new mongoose.Schema(
   {
@@ -138,11 +226,21 @@ export const Question =
   mongoose.models.Question || mongoose.model("Question", questionSchema);
 export const Problem =
   mongoose.models.Problem || mongoose.model("Problem", problemSchema);
+export const PracticeQuestionData =
+  mongoose.models.PracticeQuestionData ||
+  mongoose.model("PracticeQuestionData", practiceQuestionDataSchema);
 export const ContestSettings =
   mongoose.models.ContestSettings ||
   mongoose.model("ContestSettings", contestSettingsSchema);
 export const Submission =
   mongoose.models.Submission || mongoose.model("Submission", submissionSchema);
+export const Language =
+  mongoose.models.Language || mongoose.model("Language", languageSchema);
+export const Module =
+  mongoose.models.Module || mongoose.model("Module", moduleSchema);
+export const PracticeQuestion =
+  mongoose.models.PracticeQuestion ||
+  mongoose.model("PracticeQuestion", practiceQuestionSchema);
 
 let connectionPromise;
 
@@ -169,6 +267,10 @@ export const connectDb = async () => {
           Question.createCollection().catch(() => undefined),
           Problem.createCollection().catch(() => undefined),
           ContestSettings.createCollection().catch(() => undefined),
+          Language.createCollection().catch(() => undefined),
+          Module.createCollection().catch(() => undefined),
+          PracticeQuestion.createCollection().catch(() => undefined),
+          PracticeQuestionData.createCollection().catch(() => undefined),
         ]);
       })
       .catch((error) => {

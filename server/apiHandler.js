@@ -9,6 +9,10 @@ import {
 } from "./compiler.js";
 import {
   ContestSettings,
+  Language,
+  Module,
+  PracticeQuestion,
+  PracticeQuestionData,
   Problem,
   Question,
   Submission,
@@ -162,7 +166,7 @@ const sendResetOtpEmail = async (email, otp) =>
   sendOtpEmail({
     email,
     otp,
-    subject: "Code Snipers password reset OTP",
+    subject: "Code Sniper password reset OTP",
     title: "Use this OTP to reset your password.",
   });
 
@@ -255,8 +259,9 @@ const normalizeProblem = (doc) => {
     title: problem.title,
     slug: problem.slug,
     difficulty: problem.difficulty,
+    status: problem.status || "published",
     programmingLanguage: problem.programmingLanguage || problem.language || "",
-    description: problem.description,
+    description: problem.description || "",
     notes: problem.notes || "",
     inputFormat: problem.inputFormat || "",
     outputFormat: problem.outputFormat || "",
@@ -268,6 +273,8 @@ const normalizeProblem = (doc) => {
       ? problem.hiddenTestCases
       : [],
     starterCode: problem.starterCode || {},
+    starterCodeTemplate: problem.starterCodeTemplate || "",
+    solution: problem.solution || "",
     tags: Array.isArray(problem.tags) ? problem.tags : [],
     timeLimit: problem.timeLimit || "",
     memoryLimit: problem.memoryLimit || "",
@@ -596,11 +603,20 @@ const buildProblemPayload = (body, { partial = false } = {}) => {
     "timeLimit",
     "memoryLimit",
     "explanation",
+    "starterCodeTemplate",
+    "solution",
   ].forEach((field) => {
     if (!partial || field in body) {
       payload[field] = String(body[field] || "").trim();
     }
   });
+
+  if (!partial || "status" in body) {
+    const status = String(body.status || "published").trim();
+    payload.status = ["draft", "published"].includes(status)
+      ? status
+      : "published";
+  }
 
   if (!partial || "sampleTestCases" in body) {
     payload.sampleTestCases = cleanTestCases(body.sampleTestCases);
@@ -628,30 +644,28 @@ const buildProblemPayload = (body, { partial = false } = {}) => {
 };
 
 const validateProblemPayload = (payload, { partial = false } = {}) => {
-  const requiredFields = [
-    "title",
-    "slug",
-    "difficulty",
-    "programmingLanguage",
-    "description",
-  ];
-  const missingField = requiredFields.find(
-    (field) => !partial && !String(payload[field] || "").trim(),
-  );
-
-  if (missingField) {
-    return `${missingField} is required.`;
+  if (!partial && !String(payload.difficulty || "").trim()) {
+    return "difficulty is required.";
   }
 
   if (
     "difficulty" in payload &&
+    payload.difficulty &&
     !["Easy", "Medium", "Hard"].includes(payload.difficulty)
   ) {
     return "difficulty must be Easy, Medium, or Hard.";
   }
 
-  if ("slug" in payload && !payload.slug) {
-    return "slug is required.";
+  if ("slug" in payload && payload.slug === "") {
+    return "slug is required when provided.";
+  }
+
+  if (
+    "status" in payload &&
+    payload.status &&
+    !["draft", "published"].includes(payload.status)
+  ) {
+    return "status must be draft or published.";
   }
 
   return "";
@@ -1050,6 +1064,8 @@ const handleProblems = async (request, response, pathname, url) => {
       url.searchParams.get("language") ||
       ""
     ).trim();
+    const status = (url.searchParams.get("status") || "").trim();
+    const tag = (url.searchParams.get("tag") || "").trim();
     const query = {};
 
     if (search) {
@@ -1079,6 +1095,14 @@ const handleProblems = async (request, response, pathname, url) => {
           ],
         },
       ];
+    }
+
+    if (status) {
+      query.status = status;
+    }
+
+    if (tag) {
+      query.tags = { $regex: `^${tag}$`, $options: "i" };
     }
 
     const [rows, total] = await Promise.all([
@@ -1182,6 +1206,835 @@ const handleProblems = async (request, response, pathname, url) => {
     }
 
     sendJson(response, 200, { message: "Problem deleted." });
+    return true;
+  }
+
+  return false;
+};
+
+const DEFAULT_LANGUAGES = [
+  { name: "Java", slug: "java", icon: "☕", order: 0 },
+  { name: "C++", slug: "cpp", icon: "⚡", order: 1 },
+  { name: "Python", slug: "python", icon: "🐍", order: 2 },
+  { name: "JavaScript", slug: "javascript", icon: "📜", order: 3 },
+  { name: "C", slug: "c", icon: "🔧", order: 4 },
+  { name: "SQL", slug: "sql", icon: "🗄", order: 5 },
+];
+
+const ensureDefaultLanguages = async () => {
+  const count = await Language.countDocuments();
+
+  if (count === 0) {
+    await Language.insertMany(DEFAULT_LANGUAGES);
+  }
+};
+
+const normalizeLanguage = (doc) => {
+  const row = typeof doc.toObject === "function" ? doc.toObject() : doc;
+
+  return {
+    id: row._id.toString(),
+    name: row.name,
+    slug: row.slug,
+    icon: row.icon || "",
+    order: row.order ?? 0,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+};
+
+const normalizeModule = (doc) => {
+  const row = typeof doc.toObject === "function" ? doc.toObject() : doc;
+
+  return {
+    id: row._id.toString(),
+    languageId: row.languageId?.toString?.() || String(row.languageId || ""),
+    title: row.title,
+    description: row.description || "",
+    order: row.order ?? 0,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+};
+
+const normalizePracticeQuestion = (doc, problem = null) => {
+  const row = typeof doc.toObject === "function" ? doc.toObject() : doc;
+
+  return {
+    id: row._id.toString(),
+    moduleId: row.moduleId?.toString?.() || String(row.moduleId || ""),
+    questionId: row.questionId?.toString?.() || "",
+    problemId: row.problemId?.toString?.() || String(row.problemId || ""),
+    questionType: row.questionType || (row.questionId ? "practice" : "global"),
+    order: row.order ?? 0,
+    status: row.status || "active",
+    question: problem ? normalizeProblem(problem) : undefined,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+};
+
+const normalizePracticeQuestionData = (doc) => normalizeProblem(doc);
+
+const findPracticeQuestionDataByIdOrSlug = async (idOrSlug, excludedId = "") => {
+  if (mongoose.Types.ObjectId.isValid(idOrSlug)) {
+    const doc = await PracticeQuestionData.findById(idOrSlug);
+    return doc;
+  }
+
+  const query = { slug: idOrSlug };
+  if (mongoose.Types.ObjectId.isValid(excludedId)) {
+    query._id = { $ne: excludedId };
+  }
+
+  return PracticeQuestionData.findOne(query);
+};
+
+const handlePracticeQuestionData = async (request, response, pathname, url) => {
+  if (request.method === "GET" && pathname === "/api/practice-question-data") {
+    const page = Math.max(
+      1,
+      Number.parseInt(url.searchParams.get("page") || "1", 10),
+    );
+    const limit = Math.min(
+      100,
+      Math.max(1, Number.parseInt(url.searchParams.get("limit") || "20", 10)),
+    );
+    const search = (url.searchParams.get("search") || "").trim();
+    const difficulty = (url.searchParams.get("difficulty") || "").trim();
+    const programmingLanguage = (
+      url.searchParams.get("programmingLanguage") ||
+      url.searchParams.get("language") ||
+      ""
+    ).trim();
+    const status = (url.searchParams.get("status") || "").trim();
+    const tag = (url.searchParams.get("tag") || "").trim();
+    const query = {};
+
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: "i" } },
+        { slug: { $regex: search, $options: "i" } },
+        { tags: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    if (difficulty) {
+      query.difficulty = difficulty;
+    }
+
+    if (programmingLanguage) {
+      query.$and = [
+        ...(query.$and || []),
+        {
+          $or: [
+            {
+              programmingLanguage: {
+                $regex: `^${programmingLanguage}$`,
+                $options: "i",
+              },
+            },
+            {
+              language: {
+                $regex: `^${programmingLanguage}$`,
+                $options: "i",
+              },
+            },
+          ],
+        },
+      ];
+    }
+
+    if (status) {
+      query.status = status;
+    }
+
+    if (tag) {
+      query.tags = { $regex: `^${tag}$`, $options: "i" };
+    }
+
+    const [rows, total] = await Promise.all([
+      PracticeQuestionData.find(query)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      PracticeQuestionData.countDocuments(query),
+    ]);
+
+    sendJson(response, 200, {
+      items: rows.map(normalizePracticeQuestionData),
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+    return true;
+  }
+
+  const questionDataId = getIdFromPath(pathname, "practice-question-data");
+
+  if (request.method === "GET" && questionDataId) {
+    const questionData = await findPracticeQuestionDataByIdOrSlug(questionDataId);
+
+    if (!questionData) {
+      sendJson(response, 404, { message: "Practice question not found." });
+      return true;
+    }
+
+    sendJson(response, 200, normalizePracticeQuestionData(questionData));
+    return true;
+  }
+
+  if (request.method === "POST" && pathname === "/api/practice-question-data") {
+    const body = await readRequestJson(request);
+    const payload = buildProblemPayload(body);
+    const validationError = validateProblemPayload(payload);
+
+    if (validationError) {
+      sendJson(response, 400, { message: validationError });
+      return true;
+    }
+
+    if (await findPracticeQuestionDataByIdOrSlug(payload.slug)) {
+      sendJson(response, 409, {
+        message: "This practice question slug is already used.",
+      });
+      return true;
+    }
+
+    const questionData = await PracticeQuestionData.create(payload);
+    sendJson(response, 201, {
+      message: "Practice question created.",
+      practiceQuestion: normalizePracticeQuestionData(questionData),
+    });
+    return true;
+  }
+
+  if (request.method === "PUT" && questionDataId) {
+    const body = await readRequestJson(request);
+    const payload = buildProblemPayload(body, { partial: true });
+    const validationError = validateProblemPayload(payload, { partial: true });
+
+    if (validationError) {
+      sendJson(response, 400, { message: validationError });
+      return true;
+    }
+
+    if (payload.slug && (await findPracticeQuestionDataByIdOrSlug(payload.slug, questionDataId))) {
+      sendJson(response, 409, {
+        message: "This practice question slug is already used.",
+      });
+      return true;
+    }
+
+    const updatedQuestionData = await PracticeQuestionData.findByIdAndUpdate(
+      questionDataId,
+      payload,
+      {
+        new: true,
+        runValidators: true,
+      },
+    );
+
+    if (!updatedQuestionData) {
+      sendJson(response, 404, { message: "Practice question not found." });
+      return true;
+    }
+
+    sendJson(response, 200, {
+      message: "Practice question updated.",
+      practiceQuestion: normalizePracticeQuestionData(updatedQuestionData),
+    });
+    return true;
+  }
+
+  if (request.method === "DELETE" && questionDataId) {
+    const deletedQuestionData = await PracticeQuestionData.findByIdAndDelete(
+      questionDataId,
+    );
+
+    if (!deletedQuestionData) {
+      sendJson(response, 404, { message: "Practice question not found." });
+      return true;
+    }
+
+    sendJson(response, 200, { message: "Practice question deleted." });
+    return true;
+  }
+
+  return false;
+};
+
+const handleProblemTags = async (request, response, pathname) => {
+  if (request.method !== "GET" || pathname !== "/api/problems/tags") {
+    return false;
+  }
+
+  const rows = await Problem.aggregate([
+    { $unwind: "$tags" },
+    { $group: { _id: { $toLower: "$tags" }, count: { $sum: 1 }, tag: { $first: "$tags" } } },
+    { $sort: { count: -1, tag: 1 } },
+  ]);
+
+  sendJson(response, 200, {
+    items: rows.map((row) => ({ tag: row.tag, count: row.count })),
+  });
+  return true;
+};
+
+const handleLanguages = async (request, response, pathname) => {
+  if (pathname === "/api/languages/reorder" && request.method === "PUT") {
+    const body = await readRequestJson(request);
+    const orderedIds = Array.isArray(body.orderedIds) ? body.orderedIds : [];
+
+    await Promise.all(
+      orderedIds.map((id, index) =>
+        Language.findByIdAndUpdate(id, { order: index }),
+      ),
+    );
+
+    sendJson(response, 200, { message: "Languages reordered." });
+    return true;
+  }
+
+  if (pathname === "/api/languages" && request.method === "GET") {
+    await ensureDefaultLanguages();
+    const rows = await Language.find({}).sort({ order: 1, name: 1 }).lean();
+    sendJson(response, 200, { items: rows.map(normalizeLanguage) });
+    return true;
+  }
+
+  if (pathname === "/api/languages" && request.method === "POST") {
+    const body = await readRequestJson(request);
+    const name = String(body.name || "").trim();
+    const slug = slugify(body.slug || name);
+    const icon = String(body.icon || "").trim();
+
+    if (!name) {
+      sendJson(response, 400, { message: "name is required." });
+      return true;
+    }
+
+    const count = await Language.countDocuments();
+    const language = await Language.create({
+      name,
+      slug,
+      icon,
+      order: count,
+    });
+
+    sendJson(response, 201, {
+      message: "Language created.",
+      language: normalizeLanguage(language),
+    });
+    return true;
+  }
+
+  const languageMatch = pathname.match(/^\/api\/languages\/([^/]+)$/);
+  const languageId = languageMatch ? decodeURIComponent(languageMatch[1]) : null;
+
+  if (languageId && request.method === "GET") {
+    const language = await Language.findById(languageId).lean();
+
+    if (!language) {
+      sendJson(response, 404, { message: "Language not found." });
+      return true;
+    }
+
+    sendJson(response, 200, normalizeLanguage(language));
+    return true;
+  }
+
+  if (languageId && request.method === "PUT") {
+    const body = await readRequestJson(request);
+    const updates = {};
+
+    if ("name" in body) updates.name = String(body.name || "").trim();
+    if ("slug" in body) updates.slug = slugify(body.slug);
+    if ("icon" in body) updates.icon = String(body.icon || "").trim();
+    if ("order" in body) updates.order = Number(body.order) || 0;
+
+    const language = await Language.findByIdAndUpdate(languageId, updates, {
+      new: true,
+      runValidators: true,
+    });
+
+    if (!language) {
+      sendJson(response, 404, { message: "Language not found." });
+      return true;
+    }
+
+    sendJson(response, 200, {
+      message: "Language updated.",
+      language: normalizeLanguage(language),
+    });
+    return true;
+  }
+
+  if (languageId && request.method === "DELETE") {
+    const modules = await Module.find({ languageId }).select("_id").lean();
+    const moduleIds = modules.map((row) => row._id);
+
+    await PracticeQuestion.deleteMany({ moduleId: { $in: moduleIds } });
+    await Module.deleteMany({ languageId });
+    const deleted = await Language.findByIdAndDelete(languageId);
+
+    if (!deleted) {
+      sendJson(response, 404, { message: "Language not found." });
+      return true;
+    }
+
+    sendJson(response, 200, { message: "Language deleted." });
+    return true;
+  }
+
+  return false;
+};
+
+const handleModules = async (request, response, pathname) => {
+  if (pathname === "/api/modules/reorder" && request.method === "PUT") {
+    const body = await readRequestJson(request);
+    const orderedIds = Array.isArray(body.orderedIds) ? body.orderedIds : [];
+
+    await Promise.all(
+      orderedIds.map((id, index) =>
+        Module.findByIdAndUpdate(id, { order: index }),
+      ),
+    );
+
+    sendJson(response, 200, { message: "Modules reordered." });
+    return true;
+  }
+
+  const languageModulesMatch = pathname.match(
+    /^\/api\/languages\/([^/]+)\/modules$/,
+  );
+
+  if (languageModulesMatch && request.method === "GET") {
+    const languageId = decodeURIComponent(languageModulesMatch[1]);
+    const rows = await Module.find({ languageId })
+      .sort({ order: 1, title: 1 })
+      .lean();
+
+    const moduleIds = rows.map((row) => row._id);
+    const questionCounts = await PracticeQuestion.aggregate([
+      { $match: { moduleId: { $in: moduleIds } } },
+      { $group: { _id: "$moduleId", count: { $sum: 1 } } },
+    ]);
+    const countMap = Object.fromEntries(
+      questionCounts.map((row) => [row._id.toString(), row.count]),
+    );
+
+    sendJson(response, 200, {
+      items: rows.map((row) => ({
+        ...normalizeModule(row),
+        questionCount: countMap[row._id.toString()] || 0,
+      })),
+    });
+    return true;
+  }
+
+  if (languageModulesMatch && request.method === "POST") {
+    const languageId = decodeURIComponent(languageModulesMatch[1]);
+    const body = await readRequestJson(request);
+    const title = String(body.title || "").trim();
+    const description = String(body.description || "").trim();
+
+    if (!title) {
+      sendJson(response, 400, { message: "title is required." });
+      return true;
+    }
+
+    const language = await Language.findById(languageId);
+
+    if (!language) {
+      sendJson(response, 404, { message: "Language not found." });
+      return true;
+    }
+
+    const count = await Module.countDocuments({ languageId });
+    const moduleDoc = await Module.create({
+      languageId,
+      title,
+      description,
+      order: count,
+    });
+
+    sendJson(response, 201, {
+      message: "Module created.",
+      module: normalizeModule(moduleDoc),
+    });
+    return true;
+  }
+
+  const moduleMatch = pathname.match(/^\/api\/modules\/([^/]+)$/);
+  const moduleId = moduleMatch ? decodeURIComponent(moduleMatch[1]) : null;
+
+  if (moduleId && request.method === "GET") {
+    const moduleDoc = await Module.findById(moduleId).lean();
+
+    if (!moduleDoc) {
+      sendJson(response, 404, { message: "Module not found." });
+      return true;
+    }
+
+    sendJson(response, 200, normalizeModule(moduleDoc));
+    return true;
+  }
+
+  if (moduleId && request.method === "PUT") {
+    const body = await readRequestJson(request);
+    const updates = {};
+
+    if ("title" in body) updates.title = String(body.title || "").trim();
+    if ("description" in body)
+      updates.description = String(body.description || "").trim();
+    if ("order" in body) updates.order = Number(body.order) || 0;
+
+    const moduleDoc = await Module.findByIdAndUpdate(moduleId, updates, {
+      new: true,
+      runValidators: true,
+    });
+
+    if (!moduleDoc) {
+      sendJson(response, 404, { message: "Module not found." });
+      return true;
+    }
+
+    sendJson(response, 200, {
+      message: "Module updated.",
+      module: normalizeModule(moduleDoc),
+    });
+    return true;
+  }
+
+  if (moduleId && request.method === "DELETE") {
+    await PracticeQuestion.deleteMany({ moduleId });
+    const deleted = await Module.findByIdAndDelete(moduleId);
+
+    if (!deleted) {
+      sendJson(response, 404, { message: "Module not found." });
+      return true;
+    }
+
+    sendJson(response, 200, { message: "Module deleted." });
+    return true;
+  }
+
+  return false;
+};
+
+const handlePracticeQuestions = async (request, response, pathname) => {
+  const reorderMatch = pathname.match(
+    /^\/api\/modules\/([^/]+)\/questions\/reorder$/,
+  );
+
+  if (reorderMatch && request.method === "PUT") {
+    const moduleId = decodeURIComponent(reorderMatch[1]);
+    const body = await readRequestJson(request);
+    const orderedIds = Array.isArray(body.orderedIds) ? body.orderedIds : [];
+
+    await Promise.all(
+      orderedIds.map((id, index) =>
+        PracticeQuestion.findByIdAndUpdate(id, { order: index }),
+      ),
+    );
+
+    sendJson(response, 200, { message: "Questions reordered." });
+    return true;
+  }
+
+  const moduleQuestionsMatch = pathname.match(
+    /^\/api\/modules\/([^/]+)\/questions$/,
+  );
+
+  if (moduleQuestionsMatch && request.method === "GET") {
+    const moduleId = decodeURIComponent(moduleQuestionsMatch[1]);
+    const rows = await PracticeQuestion.find({ moduleId })
+      .sort({ order: 1, createdAt: 1 })
+      .lean();
+
+    const globalProblemIds = rows
+      .filter((row) => row.questionType === "global" || (!row.questionType && row.problemId))
+      .map((row) => String(row.problemId || ""))
+      .filter(Boolean);
+    const practiceQuestionIds = rows
+      .filter((row) => row.questionType === "practice" || (!row.questionType && row.questionId))
+      .map((row) => String(row.questionId || ""))
+      .filter(Boolean);
+
+    const [problems, practiceQuestions] = await Promise.all([
+      globalProblemIds.length
+        ? Problem.find({ _id: { $in: globalProblemIds } }).lean()
+        : Promise.resolve([]),
+      practiceQuestionIds.length
+        ? PracticeQuestionData.find({ _id: { $in: practiceQuestionIds } }).lean()
+        : Promise.resolve([]),
+    ]);
+
+    const problemMap = Object.fromEntries(
+      problems.map((row) => [row._id.toString(), row]),
+    );
+    const questionMap = Object.fromEntries(
+      practiceQuestions.map((row) => [row._id.toString(), row]),
+    );
+
+    const validRows = [];
+    const orphanedIds = [];
+
+    for (const row of rows) {
+      const questionType =
+        row.questionType || (row.questionId ? "practice" : "global");
+      const referencedQuestion =
+        questionType === "practice"
+          ? questionMap[row.questionId?.toString?.() || String(row.questionId)]
+          : problemMap[row.problemId?.toString?.() || String(row.problemId)];
+
+      if (referencedQuestion) {
+        validRows.push({ row, referencedQuestion });
+      } else {
+        orphanedIds.push(row._id);
+      }
+    }
+
+    if (orphanedIds.length) {
+      await PracticeQuestion.deleteMany({ _id: { $in: orphanedIds } });
+    }
+
+    sendJson(response, 200, {
+      items: validRows.map(({ row, referencedQuestion }) =>
+        normalizePracticeQuestion(row, referencedQuestion),
+      ),
+    });
+    return true;
+  }
+
+  if (moduleQuestionsMatch && request.method === "POST") {
+    const moduleId = decodeURIComponent(moduleQuestionsMatch[1]);
+    const body = await readRequestJson(request);
+    const problemIds = (
+      Array.isArray(body.problemIds) ? body.problemIds : [body.problemId]
+    )
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+      .filter((id, index, list) => list.indexOf(id) === index);
+    const practiceQuestionIds = (
+      Array.isArray(body.practiceQuestionIds)
+        ? body.practiceQuestionIds
+        : Array.isArray(body.questionIds)
+        ? body.questionIds
+        : [body.practiceQuestionId || body.questionId]
+    )
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+      .filter((id, index, list) => list.indexOf(id) === index);
+
+    if (!problemIds.length && !practiceQuestionIds.length) {
+      sendJson(response, 400, {
+        message:
+          "problemId/problemIds or practiceQuestionId/practiceQuestionIds is required.",
+      });
+      return true;
+    }
+
+    const moduleDoc = await Module.findById(moduleId);
+
+    if (!moduleDoc) {
+      sendJson(response, 404, { message: "Module not found." });
+      return true;
+    }
+
+    const [problems, practiceQuestions] = await Promise.all([
+      problemIds.length
+        ? Problem.find({ _id: { $in: problemIds } })
+        : Promise.resolve([]),
+      practiceQuestionIds.length
+        ? PracticeQuestionData.find({ _id: { $in: practiceQuestionIds } })
+        : Promise.resolve([]),
+    ]);
+
+    const problemMap = Object.fromEntries(
+      problems.map((problem) => [problem._id.toString(), problem]),
+    );
+    const practiceQuestionDataMap = Object.fromEntries(
+      practiceQuestions.map((question) => [question._id.toString(), question]),
+    );
+
+    const missingProblemIds = problemIds.filter((id) => !problemMap[id]);
+    const missingPracticeQuestionIds = practiceQuestionIds.filter(
+      (id) => !practiceQuestionDataMap[id],
+    );
+
+    if (missingProblemIds.length || missingPracticeQuestionIds.length) {
+      sendJson(response, 404, {
+        message: missingProblemIds.length && missingPracticeQuestionIds.length
+          ? "One or more referenced problems or practice questions were not found."
+          : missingProblemIds.length
+          ? "One or more problems were not found."
+          : "One or more practice questions were not found.",
+      });
+      return true;
+    }
+
+    const [existingGlobalRows, existingPracticeRows] = await Promise.all([
+      problemIds.length
+        ? PracticeQuestion.find({
+            moduleId,
+            problemId: { $in: problemIds },
+          }).lean()
+        : Promise.resolve([]),
+      practiceQuestionIds.length
+        ? PracticeQuestion.find({
+            moduleId,
+            questionType: "practice",
+            questionId: { $in: practiceQuestionIds },
+          }).lean()
+        : Promise.resolve([]),
+    ]);
+
+    const existingProblemIds = new Set(
+      existingGlobalRows.map((row) =>
+        row.problemId?.toString?.() || String(row.problemId),
+      ),
+    );
+    const existingPracticeIds = new Set(
+      existingPracticeRows.map((row) =>
+        row.questionId?.toString?.() || String(row.questionId),
+      ),
+    );
+
+    const newProblemIds = problemIds.filter((id) => !existingProblemIds.has(id));
+    const newPracticeQuestionIds = practiceQuestionIds.filter(
+      (id) => !existingPracticeIds.has(id),
+    );
+
+    if (!newProblemIds.length && !newPracticeQuestionIds.length) {
+      sendJson(response, 409, {
+        message: "All selected questions are already in the module.",
+      });
+      return true;
+    }
+
+    const count = await PracticeQuestion.countDocuments({ moduleId });
+    const status = body.status === "inactive" ? "inactive" : "active";
+    let nextOrder = count;
+    const createdQuestions = [];
+
+    if (newProblemIds.length) {
+      const globalItems = newProblemIds.map((problemId) => ({
+        moduleId,
+        problemId,
+        questionType: "global",
+        order: nextOrder++,
+        status,
+      }));
+      createdQuestions.push(...(await PracticeQuestion.insertMany(globalItems)));
+    }
+
+    if (newPracticeQuestionIds.length) {
+      const practiceItems = newPracticeQuestionIds.map((questionId) => ({
+        moduleId,
+        questionId,
+        questionType: "practice",
+        order: nextOrder++,
+        status,
+      }));
+      createdQuestions.push(...(await PracticeQuestion.insertMany(practiceItems)));
+    }
+
+    const skippedCount =
+      problemIds.length + practiceQuestionIds.length - createdQuestions.length;
+    const addMessage = createdQuestions.length
+      ? `${createdQuestions.length} question${
+          createdQuestions.length === 1 ? "" : "s"
+        } added to module.`
+      : "No new questions were added.";
+
+    sendJson(response, createdQuestions.length ? 201 : 200, {
+      message: skippedCount ? `${addMessage} ${skippedCount} skipped.` : addMessage,
+      skipped: skippedCount,
+      items: createdQuestions.map((practiceQuestion) => {
+        const questionType = practiceQuestion.questionType ||
+          (practiceQuestion.questionId ? "practice" : "global");
+        const referencedQuestion =
+          questionType === "practice"
+            ? practiceQuestionDataMap[
+                practiceQuestion.questionId?.toString?.() ||
+                  String(practiceQuestion.questionId)
+              ]
+            : problemMap[
+                practiceQuestion.problemId?.toString?.() ||
+                  String(practiceQuestion.problemId)
+              ];
+        return normalizePracticeQuestion(practiceQuestion, referencedQuestion);
+      }),
+      practiceQuestion: createdQuestions[0]
+        ? normalizePracticeQuestion(
+            createdQuestions[0],
+            createdQuestions[0].questionType === "practice"
+              ? practiceQuestionDataMap[
+                  createdQuestions[0].questionId?.toString?.() ||
+                    String(createdQuestions[0].questionId)
+                ]
+              : problemMap[
+                  createdQuestions[0].problemId?.toString?.() ||
+                    String(createdQuestions[0].problemId)
+                ],
+          )
+        : null,
+    });
+    return true;
+  }
+
+  const practiceQuestionMatch = pathname.match(
+    /^\/api\/practice-questions\/([^/]+)$/,
+  );
+  const practiceQuestionId = practiceQuestionMatch
+    ? decodeURIComponent(practiceQuestionMatch[1])
+    : null;
+
+  if (practiceQuestionId && request.method === "PUT") {
+    const body = await readRequestJson(request);
+    const updates = {};
+
+    if ("status" in body) {
+      updates.status = body.status === "inactive" ? "inactive" : "active";
+    }
+
+    if ("order" in body) {
+      updates.order = Number(body.order) || 0;
+    }
+
+    const practiceQuestion = await PracticeQuestion.findByIdAndUpdate(
+      practiceQuestionId,
+      updates,
+      { new: true },
+    );
+
+    if (!practiceQuestion) {
+      sendJson(response, 404, { message: "Practice question not found." });
+      return true;
+    }
+
+    const problem = await Problem.findById(practiceQuestion.problemId).lean();
+
+    sendJson(response, 200, {
+      message: "Practice question updated.",
+      practiceQuestion: normalizePracticeQuestion(practiceQuestion, problem),
+    });
+    return true;
+  }
+
+  if (practiceQuestionId && request.method === "DELETE") {
+    const deleted = await PracticeQuestion.findByIdAndDelete(practiceQuestionId);
+
+    if (!deleted) {
+      sendJson(response, 404, { message: "Practice question not found." });
+      return true;
+    }
+
+    sendJson(response, 200, { message: "Question removed from module." });
     return true;
   }
 
@@ -1324,7 +2177,27 @@ export const handleApiRequest = async (request, response) => {
       return true;
     }
 
+    if (await handleProblemTags(request, response, pathname)) {
+      return true;
+    }
+
     if (await handleProblems(request, response, pathname, url)) {
+      return true;
+    }
+
+    if (await handlePracticeQuestionData(request, response, pathname, url)) {
+      return true;
+    }
+
+    if (await handleLanguages(request, response, pathname)) {
+      return true;
+    }
+
+    if (await handleModules(request, response, pathname)) {
+      return true;
+    }
+
+    if (await handlePracticeQuestions(request, response, pathname)) {
       return true;
     }
 
@@ -1335,6 +2208,7 @@ export const handleApiRequest = async (request, response) => {
     sendJson(response, 404, { message: "API route not found." });
     return true;
   } catch (error) {
+    const errorMessage = error?.message || "";
     const duplicateField = error?.keyPattern
       ? Object.keys(error.keyPattern)[0]
       : "";
