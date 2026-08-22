@@ -17,6 +17,8 @@ export const pageUrls = [
 ];
 
 const quizCategoryUrlPattern = /^\/quiz\/(java|c-plus-plus|html|css|javascript)$/;
+const practicePathUrlPattern = /^\/practice\/[^/]+(?:\/modules\/[^/]+)?\/?$/;
+const problemDetailUrlPattern = /^\/(?:problem|practice-question)\/[^/]+\/?$/;
 
 const contentTypes = {
   ".css": "text/css",
@@ -59,7 +61,12 @@ export const handlePageRequest = (request, response, distPath) => {
   }
 
   if (
-    (pageUrls.includes(url.pathname) || quizCategoryUrlPattern.test(url.pathname)) &&
+    (
+      pageUrls.includes(url.pathname) ||
+      quizCategoryUrlPattern.test(url.pathname) ||
+      practicePathUrlPattern.test(url.pathname) ||
+      problemDetailUrlPattern.test(url.pathname)
+    ) &&
     fs.existsSync(indexPath)
   ) {
     sendFile(response, indexPath);
