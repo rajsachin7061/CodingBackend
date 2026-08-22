@@ -1274,6 +1274,68 @@ const normalizePracticeQuestion = (doc, problem = null) => {
   };
 };
 
+const getActiveQuestionCountsByLanguage = async (languages) => {
+  const modules = await Module.find({ languageId: { $in: languages.map((language) => language._id) } }).select("_id languageId").lean();
+  const moduleLanguageMap = new Map(modules.map((moduleDoc) => [moduleDoc._id.toString(), moduleDoc.languageId.toString()]));
+  const activeCounts = modules.length ? await PracticeQuestion.aggregate([
+    { $match: { moduleId: { $in: modules.map((moduleDoc) => moduleDoc._id) }, status: "active" } },
+    { $group: { _id: "$moduleId", count: { $sum: 1 } } },
+  ]) : [];
+  const counts = new Map();
+  activeCounts.forEach((row) => {
+    const languageId = moduleLanguageMap.get(row._id.toString());
+    if (languageId) counts.set(languageId, (counts.get(languageId) || 0) + row.count);
+  });
+  return counts;
+};
+
+const getResolvedPracticeQuestions = async (moduleId, status) => {
+  const rows = await PracticeQuestion.find(status ? { moduleId, status } : { moduleId }).sort({ order: 1, createdAt: 1 }).lean();
+  const globalIds = rows.filter((row) => row.questionType === "global" || (!row.questionType && row.problemId)).map((row) => row.problemId).filter(Boolean);
+  const practiceIds = rows.filter((row) => row.questionType === "practice" || (!row.questionType && row.questionId)).map((row) => row.questionId).filter(Boolean);
+  const [problems, practiceData] = await Promise.all([
+    globalIds.length ? Problem.find({ _id: { $in: globalIds } }).lean() : Promise.resolve([]),
+    practiceIds.length ? PracticeQuestionData.find({ _id: { $in: practiceIds } }).lean() : Promise.resolve([]),
+  ]);
+  const problemMap = new Map(problems.map((problem) => [problem._id.toString(), problem]));
+  const dataMap = new Map(practiceData.map((question) => [question._id.toString(), question]));
+  return rows.flatMap((row) => {
+    const type = row.questionType || (row.questionId ? "practice" : "global");
+    const question = type === "practice" ? dataMap.get(String(row.questionId)) : problemMap.get(String(row.problemId));
+    return question ? [normalizePracticeQuestion(row, question)] : [];
+  });
+};
+
+const handleStudentPractice = async (request, response, pathname) => {
+  if (request.method !== "GET" || !pathname.startsWith("/api/practice/")) return false;
+  if (pathname === "/api/practice/languages") {
+    await ensureDefaultLanguages();
+    const languages = await Language.find({}).sort({ order: 1, name: 1 }).lean();
+    const counts = await getActiveQuestionCountsByLanguage(languages);
+    sendJson(response, 200, { items: languages.map((language) => ({ ...normalizeLanguage(language), questionCount: counts.get(language._id.toString()) || 0 })) });
+    return true;
+  }
+  const modulesMatch = pathname.match(/^\/api\/practice\/languages\/([^/]+)\/modules$/);
+  if (modulesMatch) {
+    const language = await Language.findOne({ slug: decodeURIComponent(modulesMatch[1]) }).lean();
+    if (!language) { sendJson(response, 404, { message: "Learning path not found." }); return true; }
+    const modules = await Module.find({ languageId: language._id }).sort({ order: 1, title: 1 }).lean();
+    const counts = await Promise.all(modules.map(async (moduleDoc) => [moduleDoc._id.toString(), await PracticeQuestion.countDocuments({ moduleId: moduleDoc._id, status: "active" })]));
+    const countMap = new Map(counts);
+    sendJson(response, 200, { language: normalizeLanguage(language), items: modules.map((moduleDoc) => ({ ...normalizeModule(moduleDoc), questionCount: countMap.get(moduleDoc._id.toString()) || 0 })) });
+    return true;
+  }
+  const questionsMatch = pathname.match(/^\/api\/practice\/languages\/([^/]+)\/modules\/([^/]+)\/questions$/);
+  if (questionsMatch) {
+    const language = await Language.findOne({ slug: decodeURIComponent(questionsMatch[1]) }).lean();
+    const moduleDoc = language ? await Module.findOne({ _id: decodeURIComponent(questionsMatch[2]), languageId: language._id }).lean() : null;
+    if (!moduleDoc) { sendJson(response, 404, { message: "Module not found in this learning path." }); return true; }
+    sendJson(response, 200, { language: normalizeLanguage(language), module: normalizeModule(moduleDoc), items: await getResolvedPracticeQuestions(moduleDoc._id, "active") });
+    return true;
+  }
+  return false;
+};
+
 const normalizePracticeQuestionData = (doc) => normalizeProblem(doc);
 
 const findPracticeQuestionDataByIdOrSlug = async (idOrSlug, excludedId = "") => {
@@ -1501,7 +1563,38 @@ const handleLanguages = async (request, response, pathname) => {
   if (pathname === "/api/languages" && request.method === "GET") {
     await ensureDefaultLanguages();
     const rows = await Language.find({}).sort({ order: 1, name: 1 }).lean();
-    sendJson(response, 200, { items: rows.map(normalizeLanguage) });
+    const modules = await Module.find({
+      languageId: { $in: rows.map((row) => row._id) },
+    }).select("_id languageId").lean();
+    const moduleLanguageMap = new Map(
+      modules.map((moduleDoc) => [
+        moduleDoc._id.toString(),
+        moduleDoc.languageId.toString(),
+      ]),
+    );
+    const activeCounts = modules.length
+      ? await PracticeQuestion.aggregate([
+          { $match: { moduleId: { $in: modules.map((moduleDoc) => moduleDoc._id) }, status: "active" } },
+          { $group: { _id: "$moduleId", count: { $sum: 1 } } },
+        ])
+      : [];
+    const languageQuestionCounts = new Map();
+    activeCounts.forEach((row) => {
+      const languageId = moduleLanguageMap.get(row._id.toString());
+      if (languageId) {
+        languageQuestionCounts.set(
+          languageId,
+          (languageQuestionCounts.get(languageId) || 0) + row.count,
+        );
+      }
+    });
+
+    sendJson(response, 200, {
+      items: rows.map((row) => ({
+        ...normalizeLanguage(row),
+        activeQuestionCount: languageQuestionCounts.get(row._id.toString()) || 0,
+      })),
+    });
     return true;
   }
 
@@ -2186,6 +2279,10 @@ export const handleApiRequest = async (request, response) => {
     }
 
     if (await handlePracticeQuestionData(request, response, pathname, url)) {
+      return true;
+    }
+
+    if (await handleStudentPractice(request, response, pathname)) {
       return true;
     }
 
