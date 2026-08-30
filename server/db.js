@@ -109,6 +109,14 @@ const problemSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
+const problemSheetSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true, unique: true, default: "default" },
+    problemIds: [{ type: mongoose.Schema.Types.ObjectId, ref: "Problem" }],
+  },
+  { timestamps: true },
+);
+
 problemSchema.index(
   { title: "text", slug: "text", tags: "text" },
   { default_language: "none", language_override: "mongoTextLanguage" },
@@ -226,6 +234,9 @@ export const Question =
   mongoose.models.Question || mongoose.model("Question", questionSchema);
 export const Problem =
   mongoose.models.Problem || mongoose.model("Problem", problemSchema);
+export const ProblemSheet =
+  mongoose.models.ProblemSheet ||
+  mongoose.model("ProblemSheet", problemSheetSchema);
 export const PracticeQuestionData =
   mongoose.models.PracticeQuestionData ||
   mongoose.model("PracticeQuestionData", practiceQuestionDataSchema);
@@ -266,6 +277,7 @@ export const connectDb = async () => {
           User.createCollection().catch(() => undefined),
           Question.createCollection().catch(() => undefined),
           Problem.createCollection().catch(() => undefined),
+          ProblemSheet.createCollection().catch(() => undefined),
           ContestSettings.createCollection().catch(() => undefined),
           Language.createCollection().catch(() => undefined),
           Module.createCollection().catch(() => undefined),
