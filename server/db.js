@@ -47,6 +47,10 @@ const contestSettingsSchema = new mongoose.Schema(
     endAt: { type: Date, default: null },
     selectedQuestionIds: { type: [String], default: [] },
     showLeaderboardToUsers: { type: Boolean, default: false },
+    quizName: { type: String, trim: true, default: "Practice Quiz" },
+    quizQuestionCount: { type: Number, default: 10, min: 1, max: 100 },
+    quizDurationSeconds: { type: Number, default: 600, min: 30, max: 14400 },
+    selectedQuizQuestionIds: { type: [String], default: [] },
   },
   { timestamps: true },
 );

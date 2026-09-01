@@ -286,23 +286,35 @@ const normalizeProblem = (doc) => {
 };
 
 const normalizeContestSettings = (doc) => ({
-  contestName: doc && doc.contestName ? String(doc.contestName).trim() : "Weekly Contest",
+  contestName:
+    doc && doc.contestName ? String(doc.contestName).trim() : "Weekly Contest",
   contestQuestionCount:
     doc && doc.contestQuestionCount != null ? doc.contestQuestionCount : 10,
   contestDurationSeconds:
     doc && doc.contestDurationSeconds != null
       ? doc.contestDurationSeconds
-      : ((doc && doc.contestQuestionCount != null ? doc.contestQuestionCount : 10) *
-          (doc && doc.contestSecondsPerQuestion != null
-            ? doc.contestSecondsPerQuestion
-            : 20)),
+      : (doc && doc.contestQuestionCount != null
+          ? doc.contestQuestionCount
+          : 10) *
+        (doc && doc.contestSecondsPerQuestion != null
+          ? doc.contestSecondsPerQuestion
+          : 20),
   isScheduled: Boolean(doc && doc.isScheduled),
   startAt: (doc && doc.startAt) || null,
   endAt: (doc && doc.endAt) || null,
-  selectedQuestionIds: doc && Array.isArray(doc.selectedQuestionIds)
-    ? doc.selectedQuestionIds
-    : [],
+  selectedQuestionIds:
+    doc && Array.isArray(doc.selectedQuestionIds)
+      ? doc.selectedQuestionIds
+      : [],
   showLeaderboardToUsers: Boolean(doc && doc.showLeaderboardToUsers),
+  quizName: doc && doc.quizName ? String(doc.quizName).trim() : "Practice Quiz",
+  quizQuestionCount:
+    doc && doc.quizQuestionCount != null ? doc.quizQuestionCount : 10,
+  quizDurationSeconds:
+    doc && doc.quizDurationSeconds != null ? doc.quizDurationSeconds : 600,
+  selectedQuizQuestionIds: Array.isArray(doc?.selectedQuizQuestionIds)
+    ? doc.selectedQuizQuestionIds
+    : [],
 });
 
 const handleVerifySolution = async (request, response, pathname) => {
@@ -1322,62 +1334,156 @@ const normalizePracticeQuestion = (doc, problem = null) => {
 };
 
 const getActiveQuestionCountsByLanguage = async (languages) => {
-  const modules = await Module.find({ languageId: { $in: languages.map((language) => language._id) } }).select("_id languageId").lean();
-  const moduleLanguageMap = new Map(modules.map((moduleDoc) => [moduleDoc._id.toString(), moduleDoc.languageId.toString()]));
-  const activeCounts = modules.length ? await PracticeQuestion.aggregate([
-    { $match: { moduleId: { $in: modules.map((moduleDoc) => moduleDoc._id) }, status: "active" } },
-    { $group: { _id: "$moduleId", count: { $sum: 1 } } },
-  ]) : [];
+  const modules = await Module.find({
+    languageId: { $in: languages.map((language) => language._id) },
+  })
+    .select("_id languageId")
+    .lean();
+  const moduleLanguageMap = new Map(
+    modules.map((moduleDoc) => [
+      moduleDoc._id.toString(),
+      moduleDoc.languageId.toString(),
+    ]),
+  );
+  const activeCounts = modules.length
+    ? await PracticeQuestion.aggregate([
+        {
+          $match: {
+            moduleId: { $in: modules.map((moduleDoc) => moduleDoc._id) },
+            status: "active",
+          },
+        },
+        { $group: { _id: "$moduleId", count: { $sum: 1 } } },
+      ])
+    : [];
   const counts = new Map();
   activeCounts.forEach((row) => {
     const languageId = moduleLanguageMap.get(row._id.toString());
-    if (languageId) counts.set(languageId, (counts.get(languageId) || 0) + row.count);
+    if (languageId)
+      counts.set(languageId, (counts.get(languageId) || 0) + row.count);
   });
   return counts;
 };
 
 const getResolvedPracticeQuestions = async (moduleId, status) => {
-  const rows = await PracticeQuestion.find(status ? { moduleId, status } : { moduleId }).sort({ order: 1, createdAt: 1 }).lean();
-  const globalIds = rows.filter((row) => row.questionType === "global" || (!row.questionType && row.problemId)).map((row) => row.problemId).filter(Boolean);
-  const practiceIds = rows.filter((row) => row.questionType === "practice" || (!row.questionType && row.questionId)).map((row) => row.questionId).filter(Boolean);
+  const rows = await PracticeQuestion.find(
+    status ? { moduleId, status } : { moduleId },
+  )
+    .sort({ order: 1, createdAt: 1 })
+    .lean();
+  const globalIds = rows
+    .filter(
+      (row) =>
+        row.questionType === "global" || (!row.questionType && row.problemId),
+    )
+    .map((row) => row.problemId)
+    .filter(Boolean);
+  const practiceIds = rows
+    .filter(
+      (row) =>
+        row.questionType === "practice" ||
+        (!row.questionType && row.questionId),
+    )
+    .map((row) => row.questionId)
+    .filter(Boolean);
   const [problems, practiceData] = await Promise.all([
-    globalIds.length ? Problem.find({ _id: { $in: globalIds } }).lean() : Promise.resolve([]),
-    practiceIds.length ? PracticeQuestionData.find({ _id: { $in: practiceIds } }).lean() : Promise.resolve([]),
+    globalIds.length
+      ? Problem.find({ _id: { $in: globalIds } }).lean()
+      : Promise.resolve([]),
+    practiceIds.length
+      ? PracticeQuestionData.find({ _id: { $in: practiceIds } }).lean()
+      : Promise.resolve([]),
   ]);
-  const problemMap = new Map(problems.map((problem) => [problem._id.toString(), problem]));
-  const dataMap = new Map(practiceData.map((question) => [question._id.toString(), question]));
+  const problemMap = new Map(
+    problems.map((problem) => [problem._id.toString(), problem]),
+  );
+  const dataMap = new Map(
+    practiceData.map((question) => [question._id.toString(), question]),
+  );
   return rows.flatMap((row) => {
     const type = row.questionType || (row.questionId ? "practice" : "global");
-    const question = type === "practice" ? dataMap.get(String(row.questionId)) : problemMap.get(String(row.problemId));
+    const question =
+      type === "practice"
+        ? dataMap.get(String(row.questionId))
+        : problemMap.get(String(row.problemId));
     return question ? [normalizePracticeQuestion(row, question)] : [];
   });
 };
 
 const handleStudentPractice = async (request, response, pathname) => {
-  if (request.method !== "GET" || !pathname.startsWith("/api/practice/")) return false;
+  if (request.method !== "GET" || !pathname.startsWith("/api/practice/"))
+    return false;
   if (pathname === "/api/practice/languages") {
     await ensureDefaultLanguages();
-    const languages = await Language.find({}).sort({ order: 1, name: 1 }).lean();
+    const languages = await Language.find({})
+      .sort({ order: 1, name: 1 })
+      .lean();
     const counts = await getActiveQuestionCountsByLanguage(languages);
-    sendJson(response, 200, { items: languages.map((language) => ({ ...normalizeLanguage(language), questionCount: counts.get(language._id.toString()) || 0 })) });
+    sendJson(response, 200, {
+      items: languages.map((language) => ({
+        ...normalizeLanguage(language),
+        questionCount: counts.get(language._id.toString()) || 0,
+      })),
+    });
     return true;
   }
-  const modulesMatch = pathname.match(/^\/api\/practice\/languages\/([^/]+)\/modules$/);
+  const modulesMatch = pathname.match(
+    /^\/api\/practice\/languages\/([^/]+)\/modules$/,
+  );
   if (modulesMatch) {
-    const language = await Language.findOne({ slug: decodeURIComponent(modulesMatch[1]) }).lean();
-    if (!language) { sendJson(response, 404, { message: "Learning path not found." }); return true; }
-    const modules = await Module.find({ languageId: language._id }).sort({ order: 1, title: 1 }).lean();
-    const counts = await Promise.all(modules.map(async (moduleDoc) => [moduleDoc._id.toString(), await PracticeQuestion.countDocuments({ moduleId: moduleDoc._id, status: "active" })]));
+    const language = await Language.findOne({
+      slug: decodeURIComponent(modulesMatch[1]),
+    }).lean();
+    if (!language) {
+      sendJson(response, 404, { message: "Learning path not found." });
+      return true;
+    }
+    const modules = await Module.find({ languageId: language._id })
+      .sort({ order: 1, title: 1 })
+      .lean();
+    const counts = await Promise.all(
+      modules.map(async (moduleDoc) => [
+        moduleDoc._id.toString(),
+        await PracticeQuestion.countDocuments({
+          moduleId: moduleDoc._id,
+          status: "active",
+        }),
+      ]),
+    );
     const countMap = new Map(counts);
-    sendJson(response, 200, { language: normalizeLanguage(language), items: modules.map((moduleDoc) => ({ ...normalizeModule(moduleDoc), questionCount: countMap.get(moduleDoc._id.toString()) || 0 })) });
+    sendJson(response, 200, {
+      language: normalizeLanguage(language),
+      items: modules.map((moduleDoc) => ({
+        ...normalizeModule(moduleDoc),
+        questionCount: countMap.get(moduleDoc._id.toString()) || 0,
+      })),
+    });
     return true;
   }
-  const questionsMatch = pathname.match(/^\/api\/practice\/languages\/([^/]+)\/modules\/([^/]+)\/questions$/);
+  const questionsMatch = pathname.match(
+    /^\/api\/practice\/languages\/([^/]+)\/modules\/([^/]+)\/questions$/,
+  );
   if (questionsMatch) {
-    const language = await Language.findOne({ slug: decodeURIComponent(questionsMatch[1]) }).lean();
-    const moduleDoc = language ? await Module.findOne({ _id: decodeURIComponent(questionsMatch[2]), languageId: language._id }).lean() : null;
-    if (!moduleDoc) { sendJson(response, 404, { message: "Module not found in this learning path." }); return true; }
-    sendJson(response, 200, { language: normalizeLanguage(language), module: normalizeModule(moduleDoc), items: await getResolvedPracticeQuestions(moduleDoc._id, "active") });
+    const language = await Language.findOne({
+      slug: decodeURIComponent(questionsMatch[1]),
+    }).lean();
+    const moduleDoc = language
+      ? await Module.findOne({
+          _id: decodeURIComponent(questionsMatch[2]),
+          languageId: language._id,
+        }).lean()
+      : null;
+    if (!moduleDoc) {
+      sendJson(response, 404, {
+        message: "Module not found in this learning path.",
+      });
+      return true;
+    }
+    sendJson(response, 200, {
+      language: normalizeLanguage(language),
+      module: normalizeModule(moduleDoc),
+      items: await getResolvedPracticeQuestions(moduleDoc._id, "active"),
+    });
     return true;
   }
   return false;
@@ -1385,7 +1491,10 @@ const handleStudentPractice = async (request, response, pathname) => {
 
 const normalizePracticeQuestionData = (doc) => normalizeProblem(doc);
 
-const findPracticeQuestionDataByIdOrSlug = async (idOrSlug, excludedId = "") => {
+const findPracticeQuestionDataByIdOrSlug = async (
+  idOrSlug,
+  excludedId = "",
+) => {
   if (mongoose.Types.ObjectId.isValid(idOrSlug)) {
     const doc = await PracticeQuestionData.findById(idOrSlug);
     return doc;
@@ -1484,7 +1593,8 @@ const handlePracticeQuestionData = async (request, response, pathname, url) => {
   const questionDataId = getIdFromPath(pathname, "practice-question-data");
 
   if (request.method === "GET" && questionDataId) {
-    const questionData = await findPracticeQuestionDataByIdOrSlug(questionDataId);
+    const questionData =
+      await findPracticeQuestionDataByIdOrSlug(questionDataId);
 
     if (!questionData) {
       sendJson(response, 404, { message: "Practice question not found." });
@@ -1530,7 +1640,10 @@ const handlePracticeQuestionData = async (request, response, pathname, url) => {
       return true;
     }
 
-    if (payload.slug && (await findPracticeQuestionDataByIdOrSlug(payload.slug, questionDataId))) {
+    if (
+      payload.slug &&
+      (await findPracticeQuestionDataByIdOrSlug(payload.slug, questionDataId))
+    ) {
       sendJson(response, 409, {
         message: "This practice question slug is already used.",
       });
@@ -1559,9 +1672,8 @@ const handlePracticeQuestionData = async (request, response, pathname, url) => {
   }
 
   if (request.method === "DELETE" && questionDataId) {
-    const deletedQuestionData = await PracticeQuestionData.findByIdAndDelete(
-      questionDataId,
-    );
+    const deletedQuestionData =
+      await PracticeQuestionData.findByIdAndDelete(questionDataId);
 
     if (!deletedQuestionData) {
       sendJson(response, 404, { message: "Practice question not found." });
@@ -1582,7 +1694,13 @@ const handleProblemTags = async (request, response, pathname) => {
 
   const rows = await Problem.aggregate([
     { $unwind: "$tags" },
-    { $group: { _id: { $toLower: "$tags" }, count: { $sum: 1 }, tag: { $first: "$tags" } } },
+    {
+      $group: {
+        _id: { $toLower: "$tags" },
+        count: { $sum: 1 },
+        tag: { $first: "$tags" },
+      },
+    },
     { $sort: { count: -1, tag: 1 } },
   ]);
 
@@ -1612,7 +1730,9 @@ const handleLanguages = async (request, response, pathname) => {
     const rows = await Language.find({}).sort({ order: 1, name: 1 }).lean();
     const modules = await Module.find({
       languageId: { $in: rows.map((row) => row._id) },
-    }).select("_id languageId").lean();
+    })
+      .select("_id languageId")
+      .lean();
     const moduleLanguageMap = new Map(
       modules.map((moduleDoc) => [
         moduleDoc._id.toString(),
@@ -1621,7 +1741,12 @@ const handleLanguages = async (request, response, pathname) => {
     );
     const activeCounts = modules.length
       ? await PracticeQuestion.aggregate([
-          { $match: { moduleId: { $in: modules.map((moduleDoc) => moduleDoc._id) }, status: "active" } },
+          {
+            $match: {
+              moduleId: { $in: modules.map((moduleDoc) => moduleDoc._id) },
+              status: "active",
+            },
+          },
           { $group: { _id: "$moduleId", count: { $sum: 1 } } },
         ])
       : [];
@@ -1639,7 +1764,8 @@ const handleLanguages = async (request, response, pathname) => {
     sendJson(response, 200, {
       items: rows.map((row) => ({
         ...normalizeLanguage(row),
-        activeQuestionCount: languageQuestionCounts.get(row._id.toString()) || 0,
+        activeQuestionCount:
+          languageQuestionCounts.get(row._id.toString()) || 0,
       })),
     });
     return true;
@@ -1672,7 +1798,9 @@ const handleLanguages = async (request, response, pathname) => {
   }
 
   const languageMatch = pathname.match(/^\/api\/languages\/([^/]+)$/);
-  const languageId = languageMatch ? decodeURIComponent(languageMatch[1]) : null;
+  const languageId = languageMatch
+    ? decodeURIComponent(languageMatch[1])
+    : null;
 
   if (languageId && request.method === "GET") {
     const language = await Language.findById(languageId).lean();
@@ -1896,11 +2024,18 @@ const handlePracticeQuestions = async (request, response, pathname) => {
       .lean();
 
     const globalProblemIds = rows
-      .filter((row) => row.questionType === "global" || (!row.questionType && row.problemId))
+      .filter(
+        (row) =>
+          row.questionType === "global" || (!row.questionType && row.problemId),
+      )
       .map((row) => String(row.problemId || ""))
       .filter(Boolean);
     const practiceQuestionIds = rows
-      .filter((row) => row.questionType === "practice" || (!row.questionType && row.questionId))
+      .filter(
+        (row) =>
+          row.questionType === "practice" ||
+          (!row.questionType && row.questionId),
+      )
       .map((row) => String(row.questionId || ""))
       .filter(Boolean);
 
@@ -1909,7 +2044,9 @@ const handlePracticeQuestions = async (request, response, pathname) => {
         ? Problem.find({ _id: { $in: globalProblemIds } }).lean()
         : Promise.resolve([]),
       practiceQuestionIds.length
-        ? PracticeQuestionData.find({ _id: { $in: practiceQuestionIds } }).lean()
+        ? PracticeQuestionData.find({
+            _id: { $in: practiceQuestionIds },
+          }).lean()
         : Promise.resolve([]),
     ]);
 
@@ -1963,8 +2100,8 @@ const handlePracticeQuestions = async (request, response, pathname) => {
       Array.isArray(body.practiceQuestionIds)
         ? body.practiceQuestionIds
         : Array.isArray(body.questionIds)
-        ? body.questionIds
-        : [body.practiceQuestionId || body.questionId]
+          ? body.questionIds
+          : [body.practiceQuestionId || body.questionId]
     )
       .map((id) => String(id || "").trim())
       .filter(Boolean)
@@ -2008,11 +2145,12 @@ const handlePracticeQuestions = async (request, response, pathname) => {
 
     if (missingProblemIds.length || missingPracticeQuestionIds.length) {
       sendJson(response, 404, {
-        message: missingProblemIds.length && missingPracticeQuestionIds.length
-          ? "One or more referenced problems or practice questions were not found."
-          : missingProblemIds.length
-          ? "One or more problems were not found."
-          : "One or more practice questions were not found.",
+        message:
+          missingProblemIds.length && missingPracticeQuestionIds.length
+            ? "One or more referenced problems or practice questions were not found."
+            : missingProblemIds.length
+              ? "One or more problems were not found."
+              : "One or more practice questions were not found.",
       });
       return true;
     }
@@ -2034,17 +2172,19 @@ const handlePracticeQuestions = async (request, response, pathname) => {
     ]);
 
     const existingProblemIds = new Set(
-      existingGlobalRows.map((row) =>
-        row.problemId?.toString?.() || String(row.problemId),
+      existingGlobalRows.map(
+        (row) => row.problemId?.toString?.() || String(row.problemId),
       ),
     );
     const existingPracticeIds = new Set(
-      existingPracticeRows.map((row) =>
-        row.questionId?.toString?.() || String(row.questionId),
+      existingPracticeRows.map(
+        (row) => row.questionId?.toString?.() || String(row.questionId),
       ),
     );
 
-    const newProblemIds = problemIds.filter((id) => !existingProblemIds.has(id));
+    const newProblemIds = problemIds.filter(
+      (id) => !existingProblemIds.has(id),
+    );
     const newPracticeQuestionIds = practiceQuestionIds.filter(
       (id) => !existingPracticeIds.has(id),
     );
@@ -2069,7 +2209,9 @@ const handlePracticeQuestions = async (request, response, pathname) => {
         order: nextOrder++,
         status,
       }));
-      createdQuestions.push(...(await PracticeQuestion.insertMany(globalItems)));
+      createdQuestions.push(
+        ...(await PracticeQuestion.insertMany(globalItems)),
+      );
     }
 
     if (newPracticeQuestionIds.length) {
@@ -2080,7 +2222,9 @@ const handlePracticeQuestions = async (request, response, pathname) => {
         order: nextOrder++,
         status,
       }));
-      createdQuestions.push(...(await PracticeQuestion.insertMany(practiceItems)));
+      createdQuestions.push(
+        ...(await PracticeQuestion.insertMany(practiceItems)),
+      );
     }
 
     const skippedCount =
@@ -2092,10 +2236,13 @@ const handlePracticeQuestions = async (request, response, pathname) => {
       : "No new questions were added.";
 
     sendJson(response, createdQuestions.length ? 201 : 200, {
-      message: skippedCount ? `${addMessage} ${skippedCount} skipped.` : addMessage,
+      message: skippedCount
+        ? `${addMessage} ${skippedCount} skipped.`
+        : addMessage,
       skipped: skippedCount,
       items: createdQuestions.map((practiceQuestion) => {
-        const questionType = practiceQuestion.questionType ||
+        const questionType =
+          practiceQuestion.questionType ||
           (practiceQuestion.questionId ? "practice" : "global");
         const referencedQuestion =
           questionType === "practice"
@@ -2167,7 +2314,8 @@ const handlePracticeQuestions = async (request, response, pathname) => {
   }
 
   if (practiceQuestionId && request.method === "DELETE") {
-    const deleted = await PracticeQuestion.findByIdAndDelete(practiceQuestionId);
+    const deleted =
+      await PracticeQuestion.findByIdAndDelete(practiceQuestionId);
 
     if (!deleted) {
       sendJson(response, 404, { message: "Practice question not found." });
@@ -2246,6 +2394,32 @@ const handleContestSettings = async (request, response, pathname) => {
 
     if (typeof body.showLeaderboardToUsers === "boolean") {
       updates.showLeaderboardToUsers = body.showLeaderboardToUsers;
+    }
+
+    if ("quizName" in body) {
+      const name =
+        typeof body.quizName === "string" ? body.quizName.trim() : "";
+      updates.quizName = name || "Practice Quiz";
+    }
+
+    if (typeof body.quizQuestionCount === "number") {
+      updates.quizQuestionCount = Math.max(
+        1,
+        Math.min(100, Math.floor(body.quizQuestionCount)),
+      );
+    }
+
+    if (typeof body.quizDurationSeconds === "number") {
+      updates.quizDurationSeconds = Math.max(
+        30,
+        Math.min(14400, Math.floor(body.quizDurationSeconds)),
+      );
+    }
+
+    if (Array.isArray(body.selectedQuizQuestionIds)) {
+      updates.selectedQuizQuestionIds = body.selectedQuizQuestionIds
+        .map((item) => (typeof item === "string" ? item.trim() : ""))
+        .filter(Boolean);
     }
 
     const settingsDoc = await getContestSettingsDoc();
