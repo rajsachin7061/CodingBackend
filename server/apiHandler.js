@@ -14,6 +14,7 @@ import {
   PracticeQuestion,
   PracticeQuestionData,
   Problem,
+  ProblemSheet,
   Question,
   Submission,
   User,
@@ -1222,6 +1223,52 @@ const handleProblems = async (request, response, pathname, url) => {
   }
 
   return false;
+};
+
+const handleProblemSheet = async (request, response, pathname) => {
+  if (pathname !== "/api/problem-sheet") return false;
+
+  if (request.method === "GET") {
+    const sheet = await ProblemSheet.findOne({ key: "default" })
+      .populate("problemIds")
+      .lean();
+    sendJson(response, 200, {
+      items: (sheet?.problemIds || []).map(normalizeProblem),
+    });
+    return true;
+  }
+
+  if (request.method === "PUT") {
+    const body = await readRequestJson(request);
+    const problemIds = Array.isArray(body.problemIds)
+      ? [...new Set(body.problemIds.map((id) => String(id).trim()).filter(Boolean))]
+      : [];
+    const problems = problemIds.length
+      ? await Problem.find({ _id: { $in: problemIds } }).lean()
+      : [];
+
+    if (problems.length !== problemIds.length) {
+      sendJson(response, 400, { message: "One or more problems were not found." });
+      return true;
+    }
+
+    const problemMap = new Map(
+      problems.map((problem) => [problem._id.toString(), problem]),
+    );
+    await ProblemSheet.findOneAndUpdate(
+      { key: "default" },
+      { key: "default", problemIds },
+      { upsert: true, new: true, runValidators: true },
+    );
+    sendJson(response, 200, {
+      message: "Problem sheet saved.",
+      items: problemIds.map((id) => problemMap.get(id)).map(normalizeProblem),
+    });
+    return true;
+  }
+
+  sendJson(response, 405, { message: "Use GET or PUT for the problem sheet." });
+  return true;
 };
 
 const DEFAULT_LANGUAGES = [
@@ -2445,6 +2492,10 @@ export const handleApiRequest = async (request, response) => {
     }
 
     if (await handleProblemTags(request, response, pathname)) {
+      return true;
+    }
+
+    if (await handleProblemSheet(request, response, pathname)) {
       return true;
     }
 
