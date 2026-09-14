@@ -167,7 +167,7 @@ const sendResetOtpEmail = async (email, otp) =>
   sendOtpEmail({
     email,
     otp,
-    subject: "Code Sniper password reset OTP",
+    subject: "CodeSniper password reset OTP",
     title: "Use this OTP to reset your password.",
   });
 
@@ -252,8 +252,11 @@ const normalizeQuestion = (doc) => ({
   updatedAt: doc.updatedAt,
 });
 
-const normalizeProblem = (doc) => {
+const normalizeProblem = (doc, { includeHidden = false } = {}) => {
   const problem = typeof doc.toObject === "function" ? doc.toObject() : doc;
+  const hiddenTestCases = Array.isArray(problem.hiddenTestCases)
+    ? problem.hiddenTestCases
+    : [];
 
   return {
     id: problem._id.toString(),
@@ -270,9 +273,8 @@ const normalizeProblem = (doc) => {
     sampleTestCases: Array.isArray(problem.sampleTestCases)
       ? problem.sampleTestCases
       : [],
-    hiddenTestCases: Array.isArray(problem.hiddenTestCases)
-      ? problem.hiddenTestCases
-      : [],
+    hiddenTestCaseCount: hiddenTestCases.length,
+    ...(includeHidden ? { hiddenTestCases } : {}),
     starterCode: problem.starterCode || {},
     starterCodeTemplate: problem.starterCodeTemplate || "",
     solution: problem.solution || "",
@@ -459,6 +461,63 @@ const normalizeSubmission = (doc) => ({
   createdAt: doc.createdAt,
   updatedAt: doc.updatedAt,
 });
+
+const normalizeUserSubmission = (doc) => {
+  const submission = normalizeSubmission(doc);
+
+  return {
+    id: submission.id,
+    problemId: submission.problemId,
+    problemSlug: submission.problemSlug,
+    language: submission.language,
+    status: submission.status,
+    passedCount: submission.passedCount,
+    totalCount: submission.totalCount,
+    runtime: doc.runtime || "",
+    memory: doc.memory || "",
+    score: doc.score ?? "",
+    createdAt: submission.createdAt,
+    updatedAt: submission.updatedAt,
+  };
+};
+
+const handleProblemSubmissions = async (request, response, pathname, url) => {
+  const match = pathname.match(/^\/api\/problems\/([^/]+)\/submissions$/);
+
+  if (!match || request.method !== "GET") {
+    return false;
+  }
+
+  const problemIdOrSlug = decodeURIComponent(match[1]);
+  const userEmail = (url.searchParams.get("userEmail") || "")
+    .trim()
+    .toLowerCase();
+
+  if (!userEmail) {
+    sendJson(response, 400, { message: "User email is required." });
+    return true;
+  }
+
+  const problem = await findProblemByIdOrSlug(problemIdOrSlug);
+
+  if (!problem) {
+    sendJson(response, 404, { message: "Problem not found." });
+    return true;
+  }
+
+  const rows = await Submission.find({
+    problemId: problem._id,
+    userEmail,
+  })
+    .sort({ createdAt: -1 })
+    .limit(50)
+    .lean();
+
+  sendJson(response, 200, {
+    items: rows.map(normalizeUserSubmission),
+  });
+  return true;
+};
 
 const handleSubmitSolution = async (request, response, pathname) => {
   const match = pathname.match(/^\/api\/problems\/([^/]+)\/submit-solution$/);
@@ -1079,6 +1138,7 @@ const handleProblems = async (request, response, pathname, url) => {
     ).trim();
     const status = (url.searchParams.get("status") || "").trim();
     const tag = (url.searchParams.get("tag") || "").trim();
+    const includeHidden = url.searchParams.get("includeHidden") === "1";
     const query = {};
 
     if (search) {
@@ -1128,7 +1188,7 @@ const handleProblems = async (request, response, pathname, url) => {
     ]);
 
     sendJson(response, 200, {
-      items: rows.map(normalizeProblem),
+      items: rows.map((row) => normalizeProblem(row, { includeHidden })),
       page,
       limit,
       total,
@@ -1140,6 +1200,7 @@ const handleProblems = async (request, response, pathname, url) => {
   const problemId = getProblemIdFromPath(pathname);
 
   if (request.method === "GET" && problemId) {
+    const includeHidden = url.searchParams.get("includeHidden") === "1";
     const problem = await findProblemByIdOrSlug(problemId);
 
     if (!problem) {
@@ -1147,7 +1208,7 @@ const handleProblems = async (request, response, pathname, url) => {
       return true;
     }
 
-    sendJson(response, 200, normalizeProblem(problem));
+    sendJson(response, 200, normalizeProblem(problem, { includeHidden }));
     return true;
   }
 
@@ -1171,7 +1232,7 @@ const handleProblems = async (request, response, pathname, url) => {
     const problem = await Problem.create(payload);
     sendJson(response, 201, {
       message: "Problem created.",
-      problem: normalizeProblem(problem),
+      problem: normalizeProblem(problem, { includeHidden: true }),
     });
     return true;
   }
@@ -1205,7 +1266,7 @@ const handleProblems = async (request, response, pathname, url) => {
 
     sendJson(response, 200, {
       message: "Problem updated.",
-      problem: normalizeProblem(updatedProblem),
+      problem: normalizeProblem(updatedProblem, { includeHidden: true }),
     });
     return true;
   }
@@ -1489,7 +1550,8 @@ const handleStudentPractice = async (request, response, pathname) => {
   return false;
 };
 
-const normalizePracticeQuestionData = (doc) => normalizeProblem(doc);
+const normalizePracticeQuestionData = (doc, options) =>
+  normalizeProblem(doc, options);
 
 const findPracticeQuestionDataByIdOrSlug = async (
   idOrSlug,
@@ -1527,6 +1589,7 @@ const handlePracticeQuestionData = async (request, response, pathname, url) => {
     ).trim();
     const status = (url.searchParams.get("status") || "").trim();
     const tag = (url.searchParams.get("tag") || "").trim();
+    const includeHidden = url.searchParams.get("includeHidden") === "1";
     const query = {};
 
     if (search) {
@@ -1581,7 +1644,9 @@ const handlePracticeQuestionData = async (request, response, pathname, url) => {
     ]);
 
     sendJson(response, 200, {
-      items: rows.map(normalizePracticeQuestionData),
+      items: rows.map((row) =>
+        normalizePracticeQuestionData(row, { includeHidden }),
+      ),
       page,
       limit,
       total,
@@ -1593,6 +1658,7 @@ const handlePracticeQuestionData = async (request, response, pathname, url) => {
   const questionDataId = getIdFromPath(pathname, "practice-question-data");
 
   if (request.method === "GET" && questionDataId) {
+    const includeHidden = url.searchParams.get("includeHidden") === "1";
     const questionData =
       await findPracticeQuestionDataByIdOrSlug(questionDataId);
 
@@ -1601,7 +1667,11 @@ const handlePracticeQuestionData = async (request, response, pathname, url) => {
       return true;
     }
 
-    sendJson(response, 200, normalizePracticeQuestionData(questionData));
+    sendJson(
+      response,
+      200,
+      normalizePracticeQuestionData(questionData, { includeHidden }),
+    );
     return true;
   }
 
@@ -1625,7 +1695,9 @@ const handlePracticeQuestionData = async (request, response, pathname, url) => {
     const questionData = await PracticeQuestionData.create(payload);
     sendJson(response, 201, {
       message: "Practice question created.",
-      practiceQuestion: normalizePracticeQuestionData(questionData),
+      practiceQuestion: normalizePracticeQuestionData(questionData, {
+        includeHidden: true,
+      }),
     });
     return true;
   }
@@ -1666,7 +1738,9 @@ const handlePracticeQuestionData = async (request, response, pathname, url) => {
 
     sendJson(response, 200, {
       message: "Practice question updated.",
-      practiceQuestion: normalizePracticeQuestionData(updatedQuestionData),
+      practiceQuestion: normalizePracticeQuestionData(updatedQuestionData, {
+        includeHidden: true,
+      }),
     });
     return true;
   }
@@ -2476,6 +2550,10 @@ export const handleApiRequest = async (request, response) => {
     }
 
     if (await handleSubmitSolution(request, response, pathname)) {
+      return true;
+    }
+
+    if (await handleProblemSubmissions(request, response, pathname, url)) {
       return true;
     }
 
