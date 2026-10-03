@@ -328,6 +328,7 @@ const handleVerifySolution = async (request, response, pathname) => {
 
   const problemIdOrSlug = decodeURIComponent(match[1]);
   const body = await readRequestJson(request);
+  const progressive = body.progressive === true;
   const language = getCompilerLanguageKey(
     body.language || body.programmingLanguage || "",
   );
@@ -363,6 +364,73 @@ const handleVerifySolution = async (request, response, pathname) => {
       passedCount: 0,
       totalCount: 0,
     });
+    return true;
+  }
+
+  if (progressive) {
+    response.writeHead(200, {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no",
+      "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*",
+      "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type,Authorization",
+    });
+    response.flushHeaders?.();
+
+    const writeProgress = (event) =>
+      response.write(`${JSON.stringify(event)}\n`);
+    let passedCount = 0;
+    let failed = false;
+
+    for (let index = 0; index < hiddenTestCases.length; index += 1) {
+      writeProgress({
+        type: "test-started",
+        testIndex: index + 1,
+        totalCount: hiddenTestCases.length,
+      });
+
+      let passed = false;
+      try {
+        const testCase = hiddenTestCases[index];
+        const result = await runCompiledCode({
+          language,
+          code,
+          stdin: String(testCase.input || ""),
+        });
+        const actualOutput = normalizeVerificationOutput(result.output);
+        const expectedOutput = normalizeVerificationOutput(testCase.output);
+        passed = actualOutput === expectedOutput;
+      } catch {
+        passed = false;
+      }
+
+      if (passed) {
+        passedCount += 1;
+      } else {
+        failed = true;
+      }
+
+      writeProgress({
+        type: "test-completed",
+        testIndex: index + 1,
+        passed,
+        passedCount,
+        totalCount: hiddenTestCases.length,
+      });
+
+      if (failed) {
+        break;
+      }
+    }
+
+    writeProgress({
+      type: "complete",
+      allPassed: !failed && passedCount === hiddenTestCases.length,
+      passedCount,
+      totalCount: hiddenTestCases.length,
+    });
+    response.end();
     return true;
   }
 
@@ -1302,14 +1370,20 @@ const handleProblemSheet = async (request, response, pathname) => {
   if (request.method === "PUT") {
     const body = await readRequestJson(request);
     const problemIds = Array.isArray(body.problemIds)
-      ? [...new Set(body.problemIds.map((id) => String(id).trim()).filter(Boolean))]
+      ? [
+          ...new Set(
+            body.problemIds.map((id) => String(id).trim()).filter(Boolean),
+          ),
+        ]
       : [];
     const problems = problemIds.length
       ? await Problem.find({ _id: { $in: problemIds } }).lean()
       : [];
 
     if (problems.length !== problemIds.length) {
-      sendJson(response, 400, { message: "One or more problems were not found." });
+      sendJson(response, 400, {
+        message: "One or more problems were not found.",
+      });
       return true;
     }
 
