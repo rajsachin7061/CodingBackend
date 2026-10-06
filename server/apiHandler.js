@@ -838,7 +838,7 @@ const handleUsers = async (request, response, pathname) => {
       return true;
     }
 
-    await User.create({
+    const user = await User.create({
       name: name.trim(),
       email: email.trim().toLowerCase(),
       username: username.trim(),
@@ -849,7 +849,21 @@ const handleUsers = async (request, response, pathname) => {
       resume: resume || {},
     });
 
-    sendJson(response, 201, { message: "User created." });
+    sendJson(response, 201, {
+      message: "User created.",
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        username: user.username || "",
+        photo: user.photo || "",
+        blocked: Boolean(user.blocked),
+        stats: user.stats || {},
+        resume: user.resume || {},
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+      },
+    });
     return true;
   }
 
