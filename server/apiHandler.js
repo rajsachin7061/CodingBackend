@@ -20,6 +20,11 @@ import {
   User,
   connectDb,
 } from "./db.js";
+import {
+  applyResendWebhookEvent,
+  verifyResendWebhook,
+  verifyUnsubscribeToken,
+} from "./dailyChallengeEmail.js";
 
 const sendJson = (response, statusCode, payload) => {
   response.writeHead(statusCode, {
@@ -37,6 +42,35 @@ const readRequestJson = async (request) =>
 
     request.on("data", (chunk) => {
       rawBody += chunk;
+    });
+
+const readRequestText = async (request, maxBytes = 1024 * 1024) =>
+    new Promise((resolve, reject) => {
+      const chunks = [];
+      let size = 0;
+      let tooLarge = false;
+
+      request.on("data", (chunk) => {
+        size += chunk.length;
+        if (size > maxBytes) {
+          tooLarge = true;
+          chunks.length = 0;
+          return;
+        }
+        if (!tooLarge) {
+          chunks.push(chunk);
+        }
+      });
+
+      request.on("end", () => {
+        if (tooLarge) {
+          reject(new Error("Webhook payload exceeds the 1 MB limit."));
+          return;
+        }
+        resolve(Buffer.concat(chunks).toString("utf8"));
+      });
+
+      request.on("error", reject);
     });
 
     request.on("end", () => {
@@ -113,11 +147,11 @@ const getResendClient = () => {
 };
 
 const sendWithResend = async ({ email, subject, html, text }) => {
-  const from = (process.env.RESEND_FROM || "").trim();
+  const from = (process.env.EMAIL_FROM || process.env.RESEND_FROM || "").trim();
 
   if (!from) {
     throw new Error(
-      "Resend is not configured. Add RESEND_FROM in backend/.env.",
+      "Resend is not configured. Add EMAIL_FROM in backend/.env.",
     );
   }
 
@@ -139,10 +173,10 @@ export const verifyResendConnection = async () => {
   try {
     getResendClient();
 
-    const from = (process.env.RESEND_FROM || "").trim();
+    const from = (process.env.EMAIL_FROM || process.env.RESEND_FROM || "").trim();
     if (!from) {
       throw new Error(
-        "Resend is not configured. Add RESEND_FROM in backend/.env.",
+        "Resend is not configured. Add EMAIL_FROM in backend/.env.",
       );
     }
 
@@ -237,6 +271,7 @@ const normalizeUser = (doc) => ({
   blocked: Boolean(doc.blocked),
   stats: doc.stats || {},
   resume: doc.resume || {},
+  dailyChallengeEmailOptIn: doc.dailyChallengeEmailOptIn === true,
   createdAt: doc.createdAt,
   updatedAt: doc.updatedAt,
 });
@@ -827,6 +862,7 @@ const handleUsers = async (request, response, pathname) => {
       password = "",
       photo = "",
       blocked = false,
+      dailyChallengeEmailOptIn = false,
       stats = {},
       resume = {},
     } = body;
@@ -845,6 +881,7 @@ const handleUsers = async (request, response, pathname) => {
       password,
       photo,
       blocked: Boolean(blocked),
+      dailyChallengeEmailOptIn: dailyChallengeEmailOptIn === true,
       stats: stats || {},
       resume: resume || {},
     });
@@ -858,6 +895,7 @@ const handleUsers = async (request, response, pathname) => {
         username: user.username || "",
         photo: user.photo || "",
         blocked: Boolean(user.blocked),
+        dailyChallengeEmailOptIn: user.dailyChallengeEmailOptIn === true,
         stats: user.stats || {},
         resume: user.resume || {},
         createdAt: user.createdAt,
@@ -878,6 +916,7 @@ const handleUsers = async (request, response, pathname) => {
       "password",
       "photo",
       "blocked",
+      "dailyChallengeEmailOptIn",
       "stats",
       "resume",
     ];
@@ -889,6 +928,13 @@ const handleUsers = async (request, response, pathname) => {
       }
 
       const value = body[field];
+
+      if (field === "dailyChallengeEmailOptIn") {
+        if (typeof value === "boolean") {
+          updates.dailyChallengeEmailOptIn = value;
+        }
+        return;
+      }
 
       if (field === "name" || field === "username") {
         updates[field] = typeof value === "string" ? value.trim() : "";
@@ -2632,6 +2678,76 @@ export const handleApiRequest = async (request, response) => {
     }
 
     await connectDb();
+
+    if (request.method === "POST" && pathname === "/api/email/resend-webhook") {
+      if (!process.env.RESEND_WEBHOOK_SECRET?.trim()) {
+        sendJson(response, 503, {
+          message: "Resend webhook is not configured on this backend.",
+        });
+        return true;
+      }
+
+      let rawPayload;
+      try {
+        rawPayload = await readRequestText(request);
+      } catch (error) {
+        sendJson(response, error.message.includes("1 MB limit") ? 413 : 400, {
+          message: error.message,
+        });
+        return true;
+      }
+
+      if (!process.env.RESEND_API_KEY?.trim()) {
+        sendJson(response, 503, {
+          message: "RESEND_API_KEY is not configured on this backend.",
+        });
+        return true;
+      }
+
+      let event;
+      try {
+        event = verifyResendWebhook({
+          payload: rawPayload,
+          headers: request.headers,
+        });
+      } catch {
+        sendJson(response, 400, { message: "Invalid Resend webhook signature." });
+        return true;
+      }
+
+      const result = await applyResendWebhookEvent(event);
+      sendJson(response, 200, { received: true, ignored: result.ignored });
+      return true;
+    }
+
+    if (
+      ["GET", "POST"].includes(request.method) &&
+      pathname === "/api/email/unsubscribe"
+    ) {
+      if (request.method === "POST") {
+        request.resume();
+      }
+      const userId = verifyUnsubscribeToken(url.searchParams.get("token"));
+      if (!userId) {
+        response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+        response.end("This unsubscribe link is invalid. Please contact support.");
+        return true;
+      }
+
+      const result = await User.updateOne(
+        { _id: userId },
+        { $set: { dailyChallengeEmailOptIn: false } },
+      );
+      if (result.matchedCount !== 1) {
+        response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+        response.end("This account could not be found.");
+        return true;
+      }
+
+      response.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("You have been unsubscribed from daily challenge emails.");
+      return true;
+    }
 
     if (await handleVerifySolution(request, response, pathname)) {
       return true;
