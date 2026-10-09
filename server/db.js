@@ -14,6 +14,7 @@ const userSchema = new mongoose.Schema(
     username: { type: String, trim: true, default: "" },
     password: { type: String, required: true },
     photo: { type: String, default: "" },
+    dailyChallengeEmailOptIn: { type: Boolean, default: false },
     blocked: { type: Boolean, default: false },
     stats: { type: Object, default: {} },
     resume: { type: Object, default: {} },
@@ -233,7 +234,55 @@ const submissionSchema = new mongoose.Schema(
 
 submissionSchema.index({ problemId: 1, userEmail: 1, createdAt: -1 });
 
+const dailyEmailTrackingSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    recipientEmail: { type: String, default: "", lowercase: true, trim: true },
+    emailType: { type: String, required: true, default: "daily_challenge" },
+    scheduledDate: { type: String, required: true },
+    resendEmailId: { type: String, default: "" },
+    status: {
+      type: String,
+      enum: ["sending", "accepted", "delivered", "failed", "uncertain", "skipped"],
+      required: true,
+    },
+    errorDetails: { type: String, default: "" },
+    attemptedAt: { type: Date, default: Date.now },
+    completedAt: { type: Date, default: null },
+  },
+  { timestamps: true },
+);
+
+dailyEmailTrackingSchema.index(
+  { userId: 1, emailType: 1, scheduledDate: 1 },
+  { unique: true },
+);
+
+const dailyEmailJobLockSchema = new mongoose.Schema(
+  {
+    _id: { type: String, required: true },
+    owner: { type: String, required: true },
+    leaseUntil: { type: Date, required: true },
+    status: {
+      type: String,
+      enum: ["running", "completed"],
+      default: "running",
+    },
+  },
+  { timestamps: true, versionKey: false },
+);
+
 export const User = mongoose.models.User || mongoose.model("User", userSchema);
+export const DailyEmailTracking =
+  mongoose.models.DailyEmailTracking ||
+  mongoose.model("DailyEmailTracking", dailyEmailTrackingSchema);
+export const DailyEmailJobLock =
+  mongoose.models.DailyEmailJobLock ||
+  mongoose.model("DailyEmailJobLock", dailyEmailJobLockSchema);
 export const Question =
   mongoose.models.Question || mongoose.model("Question", questionSchema);
 export const Problem =
@@ -279,6 +328,8 @@ export const connectDb = async () => {
         // Ensure both MongoDB collections exist before first user/admin actions.
         await Promise.all([
           User.createCollection().catch(() => undefined),
+          DailyEmailTracking.createCollection().catch(() => undefined),
+          DailyEmailJobLock.createCollection().catch(() => undefined),
           Question.createCollection().catch(() => undefined),
           Problem.createCollection().catch(() => undefined),
           ProblemSheet.createCollection().catch(() => undefined),
@@ -288,6 +339,7 @@ export const connectDb = async () => {
           PracticeQuestion.createCollection().catch(() => undefined),
           PracticeQuestionData.createCollection().catch(() => undefined),
         ]);
+        await DailyEmailTracking.createIndexes();
       })
       .catch((error) => {
         connectionPromise = undefined;

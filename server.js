@@ -6,6 +6,7 @@ import dotenv from "dotenv";
 import { handleApiRequest, verifyResendConnection } from "./server/apiHandler.js";
 import { verifyCompilerSetup } from "./server/compiler.js";
 import { connectDb } from "./server/db.js";
+import { startDailyChallengeScheduler } from "./server/dailyChallengeEmail.js";
 import { handlePageRequest } from "./server/pageHandler.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -39,6 +40,7 @@ server.listen(port, () => {
   connectDb()
     .then(() => {
       console.log("Database connected successfully.");
+      startDailyChallengeScheduler();
     })
     .catch((error) => {
       console.error("Database connection error:", error.message);
