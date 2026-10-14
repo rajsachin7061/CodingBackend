@@ -272,9 +272,203 @@ const normalizeUser = (doc) => ({
   stats: doc.stats || {},
   resume: doc.resume || {},
   dailyChallengeEmailOptIn: doc.dailyChallengeEmailOptIn === true,
+  activityDates: Array.isArray(doc.activityDates) ? doc.activityDates : [],
+  recentSolved: Array.isArray(doc.recentSolved) ? doc.recentSolved : [],
+  streak: doc.streak || {},
   createdAt: doc.createdAt,
   updatedAt: doc.updatedAt,
 });
+
+const getLocalDateKey = (value) => {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+
+  return `${year}-${month}-${day}`;
+};
+
+const getStreakSummary = (activityDates = []) => {
+  const uniqueDates = Array.from(
+    new Set(
+      activityDates
+        .map((value) => getLocalDateKey(value))
+        .filter(Boolean),
+    ),
+  ).sort();
+
+  if (!uniqueDates.length) {
+    return { current: 0, longest: 0, todayActive: false, activeDays: 0 };
+  }
+
+  const today = new Date();
+  const todayKey = getLocalDateKey(today);
+  const dateSet = new Set(uniqueDates);
+  let current = 0;
+  let cursor = new Date(today);
+
+  while (dateSet.has(getLocalDateKey(cursor))) {
+    current += 1;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+
+  let longest = 1;
+  let running = 1;
+
+  for (let index = 1; index < uniqueDates.length; index += 1) {
+    const previousDate = new Date(`${uniqueDates[index - 1]}T00:00:00`);
+    const currentDate = new Date(`${uniqueDates[index]}T00:00:00`);
+    const deltaDays = Math.round(
+      (previousDate.getTime() - currentDate.getTime()) / 86400000,
+    );
+
+    if (deltaDays === 1) {
+      running += 1;
+      longest = Math.max(longest, running);
+    } else {
+      running = 1;
+    }
+  }
+
+  return {
+    current,
+    longest,
+    todayActive: Boolean(todayKey && dateSet.has(todayKey)),
+    activeDays: uniqueDates.length,
+  };
+};
+
+const getProfileSummary = async (email) => {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  const user = await User.findOne({ email: normalizedEmail }).lean();
+
+  if (!user) {
+    return null;
+  }
+
+  const uniqueAcceptedSubmissions = [];
+  const seenProblemKeys = new Set();
+  const acceptedSubmissions = await Submission.find({
+    userEmail: normalizedEmail,
+    status: "Accepted",
+  })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  for (const submission of acceptedSubmissions) {
+    const key = submission.problemId?.toString() || submission.problemSlug || "";
+
+    if (!key || seenProblemKeys.has(key)) {
+      continue;
+    }
+
+    seenProblemKeys.add(key);
+    uniqueAcceptedSubmissions.push(submission);
+  }
+
+  const activityMap = new Map();
+  uniqueAcceptedSubmissions.forEach((submission) => {
+    const key = getLocalDateKey(submission.createdAt || submission.updatedAt);
+
+    if (!key) {
+      return;
+    }
+
+    activityMap.set(key, (activityMap.get(key) || 0) + 1);
+  });
+
+  const activityDates = Array.from(activityMap.keys()).sort();
+  const streakSummary = getStreakSummary(activityDates);
+  const solvedCount = uniqueAcceptedSubmissions.length;
+  const totalCorrect = Number(user?.stats?.totalCorrect || solvedCount || 0);
+  const completedQuizzes = Number(user?.stats?.completedQuizzes || 0);
+  const accuracy = solvedCount > 0 ? Math.min(100, Math.round((totalCorrect / solvedCount) * 100)) : 0;
+  const availableCredits = Math.floor(solvedCount / 3);
+  const nextCreditProgress = solvedCount % 3;
+
+  const problemIds = uniqueAcceptedSubmissions
+    .map((submission) => (submission.problemId ? submission.problemId.toString() : ""))
+    .filter(Boolean);
+  const problemMap = new Map(
+    (await Problem.find({ _id: { $in: problemIds } }).lean()).map((problem) => [
+      problem._id.toString(),
+      problem,
+    ]),
+  );
+
+  const recentSolved = uniqueAcceptedSubmissions.slice(0, 8).map((submission) => {
+    const problem = problemMap.get(submission.problemId?.toString() || "");
+    const solvedDate = new Date(submission.createdAt || submission.updatedAt);
+
+    return {
+      title: problem?.title || submission.problemSlug || "Solved problem",
+      difficulty: problem?.difficulty || "N/A",
+      topic: Array.isArray(problem?.tags) && problem.tags.length ? problem.tags.join(", ") : "General",
+      language: submission.language || "",
+      accepted: submission.status === "Accepted",
+      date: getLocalDateKey(solvedDate) || "",
+      solvedAt: solvedDate.toISOString(),
+    };
+  });
+
+  return {
+    user: normalizeUser(user),
+    stats: {
+      ...(user.stats || {}),
+      totalSolved: solvedCount,
+      totalCorrect,
+      completedQuizzes,
+      accuracy,
+      availableSolutionCredits: availableCredits,
+      nextCreditProgress,
+      currentStreak: streakSummary.current,
+      longestStreak: streakSummary.longest,
+      totalActiveDays: streakSummary.activeDays,
+      activityDates,
+    },
+    activityDates,
+    streak: streakSummary,
+    recentSolved,
+    badges: [
+      { label: "Bronze", threshold: 50, unlocked: solvedCount >= 50 },
+      { label: "Silver", threshold: 150, unlocked: solvedCount >= 150 },
+      { label: "Gold", threshold: 300, unlocked: solvedCount >= 300 },
+      { label: "Diamond", threshold: 1000, unlocked: solvedCount >= 1000 },
+    ],
+    availableCredits,
+    nextCreditProgress,
+  };
+};
+
+const hydrateUserProfile = async (doc) => {
+  const baseUser = normalizeUser(doc);
+  const summary = await getProfileSummary(baseUser.email);
+
+  if (!summary) {
+    return baseUser;
+  }
+
+  return {
+    ...baseUser,
+    ...summary.user,
+    stats: {
+      ...baseUser.stats,
+      ...(summary.stats || {}),
+    },
+    activityDates: Array.isArray(summary.activityDates)
+      ? summary.activityDates
+      : baseUser.activityDates || [],
+    recentSolved: Array.isArray(summary.recentSolved)
+      ? summary.recentSolved
+      : baseUser.recentSolved || [],
+    streak: summary.streak || baseUser.streak || {},
+  };
+};
 
 const normalizeQuestion = (doc) => ({
   id: doc._id.toString(),
@@ -847,9 +1041,55 @@ const validateProblemPayload = (payload, { partial = false } = {}) => {
 };
 
 const handleUsers = async (request, response, pathname) => {
+  if (request.method === "GET" && pathname === "/api/users/profile-summary") {
+    const email = String(
+      new URL(request.url, "http://localhost").searchParams.get("email") || "",
+    )
+      .trim()
+      .toLowerCase();
+
+    if (!email) {
+      sendJson(response, 400, { message: "User email is required." });
+      return true;
+    }
+
+    const summary = await getProfileSummary(email);
+
+    if (!summary) {
+      sendJson(response, 404, { message: "User not found." });
+      return true;
+    }
+
+    sendJson(response, 200, summary);
+    return true;
+  }
+
+  if (request.method === "GET" && pathname === "/api/profile") {
+    const url = new URL(request.url, "http://localhost");
+    const email = String(url.searchParams.get("email") || "").trim().toLowerCase();
+
+    if (!email) {
+      sendJson(response, 400, { message: "User email is required." });
+      return true;
+    }
+
+    const summary = await getProfileSummary(email);
+
+    if (!summary) {
+      sendJson(response, 404, { message: "User not found." });
+      return true;
+    }
+
+    sendJson(response, 200, summary);
+    return true;
+  }
+
   if (request.method === "GET" && pathname === "/api/users") {
-    const rows = await User.find({}).sort({ createdAt: 1 });
-    sendJson(response, 200, rows.map(normalizeUser));
+    const rows = await User.find({}).sort({ createdAt: 1 }).lean();
+    const users = await Promise.all(
+      rows.map(async (row) => hydrateUserProfile(row)),
+    );
+    sendJson(response, 200, users);
     return true;
   }
 
@@ -886,20 +1126,25 @@ const handleUsers = async (request, response, pathname) => {
       resume: resume || {},
     });
 
+    const hydratedUser = await hydrateUserProfile(user);
+
     sendJson(response, 201, {
       message: "User created.",
       user: {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        username: user.username || "",
-        photo: user.photo || "",
-        blocked: Boolean(user.blocked),
-        dailyChallengeEmailOptIn: user.dailyChallengeEmailOptIn === true,
-        stats: user.stats || {},
-        resume: user.resume || {},
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
+        id: hydratedUser.id,
+        name: hydratedUser.name,
+        email: hydratedUser.email,
+        username: hydratedUser.username || "",
+        photo: hydratedUser.photo || "",
+        blocked: Boolean(hydratedUser.blocked),
+        dailyChallengeEmailOptIn: hydratedUser.dailyChallengeEmailOptIn === true,
+        stats: hydratedUser.stats || {},
+        resume: hydratedUser.resume || {},
+        activityDates: hydratedUser.activityDates || [],
+        recentSolved: hydratedUser.recentSolved || [],
+        streak: hydratedUser.streak || {},
+        createdAt: hydratedUser.createdAt,
+        updatedAt: hydratedUser.updatedAt,
       },
     });
     return true;
@@ -968,9 +1213,11 @@ const handleUsers = async (request, response, pathname) => {
       return true;
     }
 
+    const hydratedUser = await hydrateUserProfile(updatedUser);
+
     sendJson(response, 200, {
       message: "User updated.",
-      user: normalizeUser(updatedUser),
+      user: hydratedUser,
     });
     return true;
   }
@@ -1016,9 +1263,11 @@ const handleAuth = async (request, response, pathname) => {
       return true;
     }
 
+    const hydratedUser = await hydrateUserProfile(user);
+
     sendJson(response, 200, {
       message: "Login successful.",
-      user: normalizeUser(user),
+      user: hydratedUser,
     });
     return true;
   }
