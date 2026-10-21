@@ -13,7 +13,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, ".env") });
 const distPath = path.join(__dirname, "..", "CodingFrontend", "dist");
-const port = process.env.PORT || 3001;
+const port = Number(process.env.PORT) || 3002;
 
 const server = http.createServer(async (request, response) => {
   const isApiHandled = await handleApiRequest(request, response);
