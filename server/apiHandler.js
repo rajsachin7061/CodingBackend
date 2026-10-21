@@ -2,6 +2,7 @@
 import mongoose from "mongoose";
 import crypto from "node:crypto";
 import { Resend } from "resend";
+import { generateProblemHelp } from "./aiHelp.js";
 import {
   isSupportedCompilerLanguage,
   runCompiledCode,
@@ -388,7 +389,9 @@ const getProfileSummary = async (email) => {
   const totalCorrect = Number(user?.stats?.totalCorrect || solvedCount || 0);
   const completedQuizzes = Number(user?.stats?.completedQuizzes || 0);
   const accuracy = solvedCount > 0 ? Math.min(100, Math.round((totalCorrect / solvedCount) * 100)) : 0;
-  const availableCredits = Math.floor(solvedCount / 3);
+  const earnedCredits = Math.floor(solvedCount / 3);
+  const usedCredits = Math.max(0, Number(user.stats?.solutionCreditsUsed) || 0);
+  const availableCredits = Math.max(0, earnedCredits - usedCredits);
   const nextCreditProgress = solvedCount % 3;
 
   const problemIds = uniqueAcceptedSubmissions
@@ -424,6 +427,8 @@ const getProfileSummary = async (email) => {
       totalCorrect,
       completedQuizzes,
       accuracy,
+      earnedSolutionCredits: earnedCredits,
+      usedSolutionCredits: usedCredits,
       availableSolutionCredits: availableCredits,
       nextCreditProgress,
       currentStreak: streakSummary.current,
@@ -481,7 +486,10 @@ const normalizeQuestion = (doc) => ({
   updatedAt: doc.updatedAt,
 });
 
-const normalizeProblem = (doc, { includeHidden = false } = {}) => {
+const normalizeProblem = (
+  doc,
+  { includeHidden = false, includeSolution = includeHidden } = {},
+) => {
   const problem = typeof doc.toObject === "function" ? doc.toObject() : doc;
   const hiddenTestCases = Array.isArray(problem.hiddenTestCases)
     ? problem.hiddenTestCases
@@ -506,11 +514,16 @@ const normalizeProblem = (doc, { includeHidden = false } = {}) => {
     ...(includeHidden ? { hiddenTestCases } : {}),
     starterCode: problem.starterCode || {},
     starterCodeTemplate: problem.starterCodeTemplate || "",
-    solution: problem.solution || "",
+    ...(includeSolution
+      ? {
+          solution: problem.solution || "",
+          explanation: problem.explanation || "",
+        }
+      : {}),
+    hasSolution: Boolean(problem.solution || problem.explanation),
     tags: Array.isArray(problem.tags) ? problem.tags : [],
     timeLimit: problem.timeLimit || "",
     memoryLimit: problem.memoryLimit || "",
-    explanation: problem.explanation || "",
     createdAt: problem.createdAt,
     updatedAt: problem.updatedAt,
   };
@@ -1468,6 +1481,156 @@ const handleQuestions = async (request, response, pathname) => {
 const getProblemIdFromPath = (pathname) => {
   const match = pathname.match(/^\/api\/problems\/([^/]+)$/);
   return match ? decodeURIComponent(match[1]) : null;
+};
+
+const handleUnlockSolution = async (request, response, pathname) => {
+  const match = pathname.match(
+    /^\/api\/(problems|practice-question-data)\/([^/]+)\/unlock-solution$/,
+  );
+
+  if (!match || request.method !== "POST") {
+    return false;
+  }
+
+  const source = match[1] === "problems" ? "problem" : "practice";
+  const problemId = decodeURIComponent(match[2]);
+  const body = await readRequestJson(request);
+  const email =
+    typeof body.userEmail === "string" ? body.userEmail.trim().toLowerCase() : "";
+
+  if (!email) {
+    sendJson(response, 400, { message: "User email is required." });
+    return true;
+  }
+
+  const user = await User.findOne({ email }).lean();
+
+  if (!user) {
+    sendJson(response, 404, { message: "User not found." });
+    return true;
+  }
+
+  const problem =
+    source === "problem"
+      ? await findProblemByIdOrSlug(problemId)
+      : await findPracticeQuestionDataByIdOrSlug(problemId);
+
+  if (!problem) {
+    sendJson(response, 404, { message: "Problem not found." });
+    return true;
+  }
+
+  if (!problem.solution && !problem.explanation) {
+    sendJson(response, 404, { message: "No solution is available." });
+    return true;
+  }
+
+  const acceptedSubmissions = await Submission.find({
+    userEmail: email,
+    status: "Accepted",
+  })
+    .select("problemId problemSlug")
+    .lean();
+  const solvedProblemKeys = new Set(
+    acceptedSubmissions
+      .map((submission) =>
+        submission.problemId?.toString() || submission.problemSlug || "",
+      )
+      .filter(Boolean),
+  );
+  const earnedCredits = Math.floor(solvedProblemKeys.size / 3);
+  const unlockKey = `${source}:${problem._id.toString()}`;
+  const currentUser = await User.findById(user._id).lean();
+  const existingUnlocks = Array.isArray(currentUser?.stats?.unlockedSolutions)
+    ? currentUser.stats.unlockedSolutions
+    : [];
+  let usedCredits = Math.max(
+    0,
+    Number(currentUser?.stats?.solutionCreditsUsed) || 0,
+  );
+
+  if (!existingUnlocks.includes(unlockKey)) {
+    if (earnedCredits <= usedCredits) {
+      sendJson(response, 402, {
+        message: "You do not have enough solution credits.",
+        availableCredits: 0,
+      });
+      return true;
+    }
+
+    const updatedUser = await User.findOneAndUpdate(
+      {
+        _id: user._id,
+        "stats.unlockedSolutions": { $ne: unlockKey },
+        $expr: {
+          $lt: [{ $ifNull: ["$stats.solutionCreditsUsed", 0] }, earnedCredits],
+        },
+      },
+      {
+        $addToSet: { "stats.unlockedSolutions": unlockKey },
+        $inc: { "stats.solutionCreditsUsed": 1 },
+      },
+      { new: true },
+    ).lean();
+
+    if (updatedUser) {
+      usedCredits = Math.max(
+        0,
+        Number(updatedUser.stats?.solutionCreditsUsed) || 0,
+      );
+    } else {
+      const latestUser = await User.findById(user._id).lean();
+      const latestUnlocks = Array.isArray(latestUser?.stats?.unlockedSolutions)
+        ? latestUser.stats.unlockedSolutions
+        : [];
+      usedCredits = Math.max(
+        0,
+        Number(latestUser?.stats?.solutionCreditsUsed) || 0,
+      );
+
+      if (!latestUnlocks.includes(unlockKey) && earnedCredits <= usedCredits) {
+        sendJson(response, 402, {
+          message: "You do not have enough solution credits.",
+          availableCredits: 0,
+        });
+        return true;
+      }
+    }
+  }
+
+  sendJson(response, 200, {
+    solution: problem.solution || "",
+    explanation: problem.explanation || "",
+    earnedCredits,
+    usedCredits,
+    availableCredits: Math.max(0, earnedCredits - usedCredits),
+  });
+  return true;
+};
+
+const handleAiProblemHelp = async (request, response, pathname) => {
+  if (pathname !== "/api/ai/problem-help" || request.method !== "POST") {
+    return false;
+  }
+
+  let body;
+  try {
+    body = await readRequestJson(request);
+  } catch (error) {
+    sendJson(response, 400, { message: error.message });
+    return true;
+  }
+
+  try {
+    const result = await generateProblemHelp(body);
+    sendJson(response, 200, result);
+  } catch (error) {
+    sendJson(response, error.statusCode || 502, {
+      message: error.message || "AI Help could not answer the request.",
+    });
+  }
+
+  return true;
 };
 
 const findProblemByIdOrSlug = (idOrSlug) => {
@@ -2926,6 +3089,10 @@ export const handleApiRequest = async (request, response) => {
       return true;
     }
 
+    if (await handleAiProblemHelp(request, response, pathname)) {
+      return true;
+    }
+
     await connectDb();
 
     if (request.method === "POST" && pathname === "/api/email/resend-webhook") {
@@ -3007,6 +3174,10 @@ export const handleApiRequest = async (request, response) => {
     }
 
     if (await handleProblemSubmissions(request, response, pathname, url)) {
+      return true;
+    }
+
+    if (await handleUnlockSolution(request, response, pathname)) {
       return true;
     }
 
