@@ -9,6 +9,7 @@ import {
 } from "./compiler.js";
 import {
   ContestSettings,
+  AuthSession,
   Language,
   Module,
   PracticeQuestion,
@@ -20,6 +21,16 @@ import {
   User,
   connectDb,
 } from "./db.js";
+import {
+  createAuthSession,
+  getRequestIdentity,
+  getRequestEntitlementModules,
+  requirePremiumModule,
+} from "./premiumAccess.js";
+import {
+  handlePremiumRequest,
+  revokeAuthSession,
+} from "./premiumHandler.js";
 import {
   applyResendWebhookEvent,
   verifyResendWebhook,
@@ -266,7 +277,6 @@ const normalizeUser = (doc) => ({
   name: doc.name,
   email: doc.email,
   username: doc.username || "",
-  password: doc.password,
   photo: doc.photo || "",
   blocked: Boolean(doc.blocked),
   stats: doc.stats || {},
@@ -508,6 +518,7 @@ const normalizeProblem = (doc, { includeHidden = false } = {}) => {
     starterCodeTemplate: problem.starterCodeTemplate || "",
     solution: problem.solution || "",
     tags: Array.isArray(problem.tags) ? problem.tags : [],
+    premiumModule: problem.premiumModule || "",
     timeLimit: problem.timeLimit || "",
     memoryLimit: problem.memoryLimit || "",
     explanation: problem.explanation || "",
@@ -515,6 +526,73 @@ const normalizeProblem = (doc, { includeHidden = false } = {}) => {
     updatedAt: problem.updatedAt,
   };
 };
+
+const normalizeVisibleProblem = (doc, modules, options = {}) => {
+  const premiumModule = doc.premiumModule || "";
+
+  if (premiumModule && !modules.includes(premiumModule)) {
+    return {
+      id: doc._id.toString(),
+      title: doc.title,
+      slug: doc.slug,
+      difficulty: doc.difficulty,
+      status: doc.status || "published",
+      premiumModule,
+      locked: true,
+    };
+  }
+
+  return normalizeProblem(doc, options);
+};
+
+const requireProblemAccess = async (request, response, sendJson, moduleName) => {
+  const result = await requirePremiumModule(moduleName)(request);
+  if (!result.allowed) {
+    sendJson(response, result.statusCode, result.body);
+    return false;
+  }
+  return true;
+};
+
+const isAdminOnlyMutation = (method, pathname) => {
+  if (["GET", "OPTIONS"].includes(method)) {
+    return false;
+  }
+
+  if (
+    /^\/api\/problems\/[^/]+\/(verify-solution|submit-solution|submissions)$/.test(
+      pathname,
+    )
+  ) {
+    return false;
+  }
+
+  return [
+    "/api/questions",
+    "/api/problems",
+    "/api/problem-sheet",
+    "/api/practice-question-data",
+    "/api/languages",
+    "/api/modules",
+    "/api/practice-questions",
+    "/api/contest-settings",
+  ].some(
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
+  );
+};
+
+const isAdminOnlyRead = (method, pathname, url) =>
+  method === "GET" &&
+  ((pathname === "/api/users") ||
+    (url.searchParams.get("includeHidden") === "1" &&
+      ["/api/problems", "/api/practice-question-data"].some(
+        (prefix) =>
+          pathname === prefix ||
+          new RegExp(`^${prefix}/[a-fA-F0-9]{24}$`).test(pathname),
+      )) ||
+    /^\/api\/languages\/[a-fA-F0-9]{24}\/modules$/.test(pathname) ||
+    /^\/api\/modules\/[a-fA-F0-9]{24}(\/questions)?$/.test(pathname) ||
+    /^\/api\/practice-questions\/[a-fA-F0-9]{24}$/.test(pathname));
 
 const normalizeContestSettings = (doc) => ({
   contestName:
@@ -579,6 +657,18 @@ const handleVerifySolution = async (request, response, pathname) => {
 
   if (!problem) {
     sendJson(response, 404, { message: "Problem not found." });
+    return true;
+  }
+
+  if (
+    problem.premiumModule &&
+    !(await requireProblemAccess(
+      request,
+      response,
+      sendJson,
+      problem.premiumModule,
+    ))
+  ) {
     return true;
   }
 
@@ -855,6 +945,18 @@ const handleSubmitSolution = async (request, response, pathname) => {
     return true;
   }
 
+  if (
+    problem.premiumModule &&
+    !(await requireProblemAccess(
+      request,
+      response,
+      sendJson,
+      problem.premiumModule,
+    ))
+  ) {
+    return true;
+  }
+
   const hiddenTestCases = Array.isArray(problem.hiddenTestCases)
     ? problem.hiddenTestCases
     : [];
@@ -952,6 +1054,13 @@ const buildProblemPayload = (body, { partial = false } = {}) => {
 
   if (!partial || "difficulty" in body) {
     payload.difficulty = String(body.difficulty || "").trim();
+  }
+
+  if (!partial || "premiumModule" in body) {
+    const premiumModule = String(body.premiumModule || "").trim().toUpperCase();
+    payload.premiumModule = ["DSA", "PRACTICE"].includes(premiumModule)
+      ? premiumModule
+      : "";
   }
 
   if (!partial || "programmingLanguage" in body || "language" in body) {
@@ -1125,11 +1234,17 @@ const handleUsers = async (request, response, pathname) => {
       stats: stats || {},
       resume: resume || {},
     });
+    const authSession = await createAuthSession({
+      userId: user._id,
+      role: "user",
+    });
 
     const hydratedUser = await hydrateUserProfile(user);
 
     sendJson(response, 201, {
       message: "User created.",
+      accessToken: authSession.token,
+      expiresAt: authSession.expiresAt,
       user: {
         id: hydratedUser.id,
         name: hydratedUser.name,
@@ -1154,9 +1269,10 @@ const handleUsers = async (request, response, pathname) => {
 
   if (request.method === "PATCH" && userId) {
     const body = await readRequestJson(request);
-    const allowedFields = [
+    const identity = await getRequestIdentity(request);
+    const allowedFields = identity?.role === "admin"
+      ? [
       "name",
-      "email",
       "username",
       "password",
       "photo",
@@ -1164,7 +1280,16 @@ const handleUsers = async (request, response, pathname) => {
       "dailyChallengeEmailOptIn",
       "stats",
       "resume",
-    ];
+      ]
+      : [
+          "name",
+          "email",
+          "username",
+          "photo",
+          "dailyChallengeEmailOptIn",
+          "stats",
+          "resume",
+        ];
     const updates = {};
 
     allowedFields.forEach((field) => {
@@ -1238,6 +1363,12 @@ const handleUsers = async (request, response, pathname) => {
 };
 
 const handleAuth = async (request, response, pathname) => {
+  if (request.method === "POST" && pathname === "/api/auth/logout") {
+    await revokeAuthSession(request);
+    sendJson(response, 200, { message: "Signed out." });
+    return true;
+  }
+
   if (request.method === "POST" && pathname === "/api/auth/login") {
     const body = await readRequestJson(request);
     const email =
@@ -1264,10 +1395,16 @@ const handleAuth = async (request, response, pathname) => {
     }
 
     const hydratedUser = await hydrateUserProfile(user);
+    const authSession = await createAuthSession({
+      userId: user._id,
+      role: "user",
+    });
 
     sendJson(response, 200, {
       message: "Login successful.",
       user: hydratedUser,
+      accessToken: authSession.token,
+      expiresAt: authSession.expiresAt,
     });
     return true;
   }
@@ -1347,6 +1484,7 @@ const handleAuth = async (request, response, pathname) => {
     user.password = password;
     await user.save();
     passwordResetOtps.delete(email);
+    await AuthSession.deleteMany({ userId: user._id, role: "user" });
 
     sendJson(response, 200, { message: "Password updated successfully." });
     return true;
@@ -1563,9 +1701,12 @@ const handleProblems = async (request, response, pathname, url) => {
         .lean(),
       Problem.countDocuments(query),
     ]);
+    const { modules } = await getRequestEntitlementModules(request);
 
     sendJson(response, 200, {
-      items: rows.map((row) => normalizeProblem(row, { includeHidden })),
+      items: rows.map((row) =>
+        normalizeVisibleProblem(row, modules, { includeHidden }),
+      ),
       page,
       limit,
       total,
@@ -1582,6 +1723,18 @@ const handleProblems = async (request, response, pathname, url) => {
 
     if (!problem) {
       sendJson(response, 404, { message: "Problem not found." });
+      return true;
+    }
+
+    if (
+      problem.premiumModule &&
+      !(await requireProblemAccess(
+        request,
+        response,
+        sendJson,
+        problem.premiumModule,
+      ))
+    ) {
       return true;
     }
 
@@ -1670,8 +1823,11 @@ const handleProblemSheet = async (request, response, pathname) => {
     const sheet = await ProblemSheet.findOne({ key: "default" })
       .populate("problemIds")
       .lean();
+    const { modules } = await getRequestEntitlementModules(request);
     sendJson(response, 200, {
-      items: (sheet?.problemIds || []).map(normalizeProblem),
+      items: (sheet?.problemIds || []).map((problem) =>
+        normalizeVisibleProblem(problem, modules),
+      ),
     });
     return true;
   }
@@ -1923,10 +2079,32 @@ const handleStudentPractice = async (request, response, pathname) => {
       });
       return true;
     }
+    const { modules } = await getRequestEntitlementModules(request);
+    const items = await getResolvedPracticeQuestions(moduleDoc._id, "active");
     sendJson(response, 200, {
       language: normalizeLanguage(language),
       module: normalizeModule(moduleDoc),
-      items: await getResolvedPracticeQuestions(moduleDoc._id, "active"),
+      items: items.map((item) => {
+        const question = item.question;
+        if (
+          !question?.premiumModule ||
+          modules.includes(question.premiumModule)
+        ) {
+          return item;
+        }
+
+        return {
+          ...item,
+          question: {
+            id: question.id,
+            title: question.title,
+            slug: question.slug,
+            difficulty: question.difficulty,
+            premiumModule: question.premiumModule,
+            locked: true,
+          },
+        };
+      }),
     });
     return true;
   }
@@ -2025,10 +2203,11 @@ const handlePracticeQuestionData = async (request, response, pathname, url) => {
         .lean(),
       PracticeQuestionData.countDocuments(query),
     ]);
+    const { modules } = await getRequestEntitlementModules(request);
 
     sendJson(response, 200, {
       items: rows.map((row) =>
-        normalizePracticeQuestionData(row, { includeHidden }),
+        normalizeVisibleProblem(row, modules, { includeHidden }),
       ),
       page,
       limit,
@@ -2047,6 +2226,18 @@ const handlePracticeQuestionData = async (request, response, pathname, url) => {
 
     if (!questionData) {
       sendJson(response, 404, { message: "Practice question not found." });
+      return true;
+    }
+
+    if (
+      questionData.premiumModule &&
+      !(await requireProblemAccess(
+        request,
+        response,
+        sendJson,
+        questionData.premiumModule,
+      ))
+    ) {
       return true;
     }
 
@@ -2928,6 +3119,51 @@ export const handleApiRequest = async (request, response) => {
 
     await connectDb();
 
+    const userResourceMatch = pathname.match(
+      /^\/api\/users\/([a-fA-F0-9]{24})$/,
+    );
+    const adminOnly =
+      isAdminOnlyMutation(request.method, pathname) ||
+      isAdminOnlyRead(request.method, pathname, url) ||
+      (request.method === "DELETE" && Boolean(userResourceMatch));
+    if (adminOnly) {
+      const identity = await getRequestIdentity(request);
+      if (!identity || identity.role !== "admin") {
+        sendJson(response, 403, {
+          code: "ADMIN_REQUIRED",
+          message: "Administrator access is required.",
+        });
+        return true;
+      }
+    }
+
+    if (request.method === "PATCH" && userResourceMatch) {
+      const identity = await getRequestIdentity(request);
+      if (
+        !identity ||
+        (identity.role !== "admin" &&
+          identity.userId?.toString() !== userResourceMatch[1])
+      ) {
+        sendJson(response, 403, {
+          code: "USER_ACCESS_DENIED",
+          message: "You may update only your own account.",
+        });
+        return true;
+      }
+    }
+
+    if (
+      await handlePremiumRequest(
+        request,
+        response,
+        pathname,
+        url,
+        sendJson,
+      )
+    ) {
+      return true;
+    }
+
     if (request.method === "POST" && pathname === "/api/email/resend-webhook") {
       if (!process.env.RESEND_WEBHOOK_SECRET?.trim()) {
         sendJson(response, 503, {
@@ -3081,6 +3317,10 @@ export const handleApiRequest = async (request, response) => {
     const isResendError = /Resend API error|Resend is not configured/i.test(
       errorMessage,
     );
+    const hasExplicitStatusCode =
+      Number.isInteger(error?.statusCode) &&
+      error.statusCode >= 400 &&
+      error.statusCode < 600;
     if (
       !isDuplicateRecord &&
       !isInvalidObjectId &&
@@ -3092,7 +3332,9 @@ export const handleApiRequest = async (request, response) => {
       console.error("API request failed:", error);
     }
 
-    const statusCode = isDuplicateRecord
+    const statusCode = hasExplicitStatusCode
+      ? error.statusCode
+      : isDuplicateRecord
       ? 409
       : isInvalidObjectId || isValidationError
         ? 400
@@ -3116,7 +3358,9 @@ export const handleApiRequest = async (request, response) => {
               ? `Database connection failed: ${error.message}. Check MONGODB_URI, MongoDB Atlas Network Access (IP allowlist), and database user credentials.`
               : isResendError
                 ? `Email delivery failed: ${error.message}`
-                : "Database error.";
+                : hasExplicitStatusCode
+                  ? error.message
+                  : "Database error.";
 
     sendJson(response, statusCode, { message });
     return true;

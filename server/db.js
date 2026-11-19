@@ -22,6 +22,112 @@ const userSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
+const authSessionSchema = new mongoose.Schema(
+  {
+    tokenHash: { type: String, required: true, unique: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    role: { type: String, enum: ["user", "admin"], required: true },
+    adminUsername: { type: String, default: "" },
+    expiresAt: { type: Date, required: true },
+  },
+  { timestamps: true },
+);
+authSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+const premiumPlanSchema = new mongoose.Schema(
+  {
+    code: { type: String, required: true, unique: true, uppercase: true },
+    name: { type: String, required: true, trim: true },
+    amount: { type: Number, required: true, min: 100 },
+    currency: { type: String, default: "INR", enum: ["INR"] },
+    modules: {
+      type: [{ type: String, enum: ["DSA", "PRACTICE"] }],
+      required: true,
+    },
+    features: { type: [String], default: [] },
+    active: { type: Boolean, default: true },
+  },
+  { timestamps: true },
+);
+
+const paymentSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    planCode: { type: String, required: true, uppercase: true },
+    modulesToGrant: {
+      type: [{ type: String, enum: ["DSA", "PRACTICE"] }],
+      required: true,
+    },
+    amount: { type: Number, required: true, min: 1 },
+    currency: { type: String, required: true, enum: ["INR"] },
+    provider: { type: String, default: "razorpay", enum: ["razorpay"] },
+    orderId: { type: String, required: true, unique: true },
+    paymentId: { type: String, default: undefined, sparse: true, unique: true },
+    status: {
+      type: String,
+      enum: [
+        "created",
+        "authorized",
+        "captured",
+        "failed",
+        "cancelled",
+        "refund_pending",
+        "refunded",
+      ],
+      default: "created",
+      required: true,
+    },
+    paidAt: { type: Date, default: null },
+    refundedAt: { type: Date, default: null },
+    failureReason: { type: String, default: "" },
+    receipt: { type: String, required: true, unique: true },
+  },
+  { timestamps: true },
+);
+paymentSchema.index({ userId: 1, createdAt: -1 });
+paymentSchema.index({ userId: 1, status: 1, modulesToGrant: 1 });
+
+const entitlementSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    module: { type: String, enum: ["DSA", "PRACTICE"], required: true },
+    purchaseId: { type: String, required: true },
+    paymentId: { type: String, required: true },
+    purchaseAmount: { type: Number, required: true, min: 1 },
+    purchaseDate: { type: Date, required: true },
+    status: {
+      type: String,
+      enum: ["active", "inactive", "refunded"],
+      default: "active",
+      required: true,
+    },
+    expiresAt: { type: Date, default: null },
+    provider: { type: String, default: "razorpay", enum: ["razorpay"] },
+  },
+  { timestamps: true },
+);
+entitlementSchema.index({ userId: 1, module: 1 }, { unique: true });
+entitlementSchema.index({ status: 1, expiresAt: 1 });
+
+const webhookEventSchema = new mongoose.Schema(
+  {
+    eventId: { type: String, required: true, unique: true },
+    eventType: { type: String, required: true },
+    processed: { type: Boolean, default: false },
+    processedAt: { type: Date, default: null },
+    error: { type: String, default: "" },
+  },
+  { timestamps: true },
+);
+
 const questionSchema = new mongoose.Schema(
   {
     category: { type: String, required: true, trim: true },
@@ -107,6 +213,12 @@ const problemSchema = new mongoose.Schema(
     starterCodeTemplate: { type: String, default: "" },
     solution: { type: String, default: "" },
     tags: { type: [String], default: [] },
+    premiumModule: {
+      type: String,
+      enum: ["", "DSA", "PRACTICE"],
+      default: "",
+      index: true,
+    },
     timeLimit: { type: String, default: "1 second" },
     memoryLimit: { type: String, default: "256 MB" },
     explanation: { type: String, default: "" },
@@ -277,6 +389,18 @@ const dailyEmailJobLockSchema = new mongoose.Schema(
 );
 
 export const User = mongoose.models.User || mongoose.model("User", userSchema);
+export const AuthSession =
+  mongoose.models.AuthSession || mongoose.model("AuthSession", authSessionSchema);
+export const PremiumPlan =
+  mongoose.models.PremiumPlan || mongoose.model("PremiumPlan", premiumPlanSchema);
+export const Payment =
+  mongoose.models.Payment || mongoose.model("Payment", paymentSchema);
+export const Entitlement =
+  mongoose.models.Entitlement ||
+  mongoose.model("Entitlement", entitlementSchema);
+export const WebhookEvent =
+  mongoose.models.WebhookEvent ||
+  mongoose.model("WebhookEvent", webhookEventSchema);
 export const DailyEmailTracking =
   mongoose.models.DailyEmailTracking ||
   mongoose.model("DailyEmailTracking", dailyEmailTrackingSchema);
@@ -328,6 +452,11 @@ export const connectDb = async () => {
         // Ensure both MongoDB collections exist before first user/admin actions.
         await Promise.all([
           User.createCollection().catch(() => undefined),
+          AuthSession.createCollection().catch(() => undefined),
+          PremiumPlan.createCollection().catch(() => undefined),
+          Payment.createCollection().catch(() => undefined),
+          Entitlement.createCollection().catch(() => undefined),
+          WebhookEvent.createCollection().catch(() => undefined),
           DailyEmailTracking.createCollection().catch(() => undefined),
           DailyEmailJobLock.createCollection().catch(() => undefined),
           Question.createCollection().catch(() => undefined),
@@ -340,6 +469,13 @@ export const connectDb = async () => {
           PracticeQuestionData.createCollection().catch(() => undefined),
         ]);
         await DailyEmailTracking.createIndexes();
+        await Promise.all([
+          AuthSession.createIndexes(),
+          PremiumPlan.createIndexes(),
+          Payment.createIndexes(),
+          Entitlement.createIndexes(),
+          WebhookEvent.createIndexes(),
+        ]);
       })
       .catch((error) => {
         connectionPromise = undefined;
